@@ -28,11 +28,11 @@ fn hb(b: &[u8]) -> u64 {
 }
 
 static PT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-const NS: usize = 256; // event-id shards
+const NS: usize = 1024; // event-id shards
 const NP: usize = 256; // person shards
 #[inline]
 fn eshard(h: u64) -> usize {
-    (h >> 56) as usize & (NS - 1)
+    (h >> 54) as usize & (NS - 1)
 }
 #[inline]
 fn pshard(h: u64) -> usize {
@@ -709,11 +709,20 @@ fn pl_price(p: u64) -> u64 {
     p >> 40
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct LSlot {
+    key: u64,
+    person: u64,
+    rname: u64, // root (person) name: ptr << 16 | len
+    oname: u64, // own name
+}
+
 /// Open-addressing table: user hash -> person hash (hash of the byte-wise min ID).
 struct LinkTable {
     mask: usize,
-    slots: Vec<(u64, u64)>, // (key, person); key 0 = empty
-    names: Vec<(usize, u16)>,
+    slots: Vec<LSlot>, // key 0 = empty
+
 }
 impl LinkTable {
     #[inline(always)]
@@ -732,7 +741,7 @@ impl LinkTable {
     fn find(&self, k: u64) -> Option<usize> {
         let mut h = self.slot(k);
         loop {
-            let kk = unsafe { self.slots.get_unchecked(h).0 };
+            let kk = unsafe { self.slots.get_unchecked(h).key };
             if kk == k {
                 return Some(h);
             }
@@ -749,13 +758,12 @@ impl LinkTable {
             use std::arch::x86_64::*;
             let h = self.slot(k);
             _mm_prefetch(self.slots.as_ptr().add(h) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(self.names.as_ptr().add(h) as *const i8, _MM_HINT_T0);
         }
     }
     #[inline(always)]
     fn person(&self, k: u64) -> u64 {
         match self.find(k) {
-            Some(h) => self.slots[h].1,
+            Some(h) => self.slots[h].person,
             None => k,
         }
     }
@@ -927,17 +935,18 @@ fn main() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
         let cap = (n * 4).next_power_of_two().max(16);
         let mask = cap - 1;
-        let mut slots: Vec<(u64, u64)> = vec![(0, 0); cap];
-        let mut names: Vec<(usize, u16)> = vec![(0, 0); cap];
-        let par: Vec<AtomicU32> = (0..0).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
-        drop(par);
+        let mut slots: Vec<LSlot> = unsafe {
+            let layout = std::alloc::Layout::array::<LSlot>(cap).unwrap();
+            let p = std::alloc::alloc_zeroed(layout) as *mut LSlot;
+            Vec::from_raw_parts(p, cap, cap)
+        };
         let parent: Vec<u32> = vec![0; cap]; // 0 = root, else parent slot + 1
         let best: Vec<u32> = vec![0; cap]; // 0 = none, else best slot + 1
         let sp = slots.as_mut_ptr() as usize;
-        let np = names.as_mut_ptr() as usize;
         let pp = parent.as_ptr() as usize;
         let bp = best.as_ptr() as usize;
-        let key_at = |h: usize| unsafe { AtomicU64::from_ptr((sp as *mut (u64, u64)).add(h) as *mut u64) };
+        let sat = |h: usize| unsafe { (sp as *mut LSlot).add(h) };
+        let key_at = |h: usize| unsafe { AtomicU64::from_ptr(&raw mut (*sat(h)).key) };
         let par_at = |h: usize| unsafe { AtomicU32::from_ptr((pp as *mut u32).add(h)) };
         let best_at = |h: usize| unsafe { AtomicU32::from_ptr((bp as *mut u32).add(h)) };
         let insert = |k: u64, ptr: usize, len: u16| -> u32 {
@@ -951,7 +960,7 @@ fn main() {
                 if cur == 0 {
                     match a.compare_exchange(0, k, Relaxed, Relaxed) {
                         Ok(_) => {
-                            unsafe { *(np as *mut (usize, u16)).add(h) = (ptr, len) };
+                            unsafe { (*sat(h)).oname = ((ptr as u64) << 16) | len as u64 };
                             return h as u32;
                         }
                         Err(x) if x == k => return h as u32,
@@ -994,8 +1003,8 @@ fn main() {
         });
         log!("  lk uf");
         let nm = |i: u32| unsafe {
-            let (p, l) = *(np as *const (usize, u16)).add(i as usize);
-            sl(p, l)
+            let o = (*sat(i as usize)).oname;
+            sl((o >> 16) as usize, o as u16)
         };
         let relax_best = |u: u32| {
             let r = find(u);
@@ -1021,11 +1030,11 @@ fn main() {
             let r = find(u);
             let bs = best_at(r as usize).load(Relaxed) - 1;
             unsafe {
-                let base = sp as *mut (u64, u64);
-                let pk = (*base.add(bs as usize)).0;
-                (*base.add(u as usize)).1 = pk;
-                let nb = np as *mut (usize, u16);
-                *nb.add(u as usize) = *nb.add(bs as usize);
+                let b = &*sat(bs as usize);
+                let (pk, on) = (b.key, b.oname);
+                let us = &mut *sat(u as usize);
+                us.person = pk;
+                us.rname = on;
             }
         };
         edges.par_iter().for_each(|v| {
@@ -1036,7 +1045,7 @@ fn main() {
         });
         drop(parent);
         drop(best);
-        LinkTable { mask, slots, names }
+        LinkTable { mask, slots }
     };
     log!("links done");
 
@@ -1169,10 +1178,10 @@ fn main() {
                 let e = &mut stg[i];
                 if pl_typ(e.payload) != 3 {
                     if let Some(h) = link_tab.find(e.person) {
-                        e.person = link_tab.slots[h].1;
-                        let (np_, nl_) = link_tab.names[h];
-                        e.name = np_;
-                        e.nlen = nl_;
+                        let sl_ = &link_tab.slots[h];
+                        e.person = sl_.person;
+                        e.name = (sl_.rname >> 16) as usize;
+                        e.nlen = sl_.rname as u16;
                     }
                     kc[pshard(e.person) + 1] += 1;
                 }
@@ -1287,6 +1296,7 @@ fn main() {
             raw.reserve(buf.len() / 5 + 2);
             let rbase = raw.as_mut_ptr();
             let mut rn = 0usize;
+            let tc0 = Instant::now();
             scan::<4>(buf, |f| {
                 let (cid, user, camp, ts) = (f[0], f[1], f[2], f[3]);
                 if cid.is_empty() || user.is_empty() {
@@ -1301,6 +1311,7 @@ fn main() {
                 rn += 1;
             });
             unsafe { raw.set_len(rn) };
+            PT[3].fetch_add(tc0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             const PF: usize = 16;
             for i in 0..raw.len().min(PF) {
                 link_tab.prefetch(raw[i].person);
@@ -1332,7 +1343,7 @@ fn main() {
             Parts { v, off }
         })
         .collect();
-    log!("clicks");
+    log!("clicks: scan {:?}", std::time::Duration::from_nanos(PT[3].load(std::sync::atomic::Ordering::Relaxed)));
 
     // ---- per person shard: sort, sessionize, attribute
     let ws_day = ws.div_euclid(DAY_MS);
@@ -1341,11 +1352,15 @@ fn main() {
     let nthreads = rayon::current_num_threads();
     let camp_accs: Vec<Mutex<Vec<[u64; 4]>>> = (0..nthreads + 1).map(|_| Mutex::new(Vec::new())).collect();
 
+    for x in PT.iter() {
+        x.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     let ss_scr: Vec<Mutex<(Vec<u32>, Vec<Ke>, Vec<Ck>)>> = (0..nthreads + 1).map(|_| Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
     let user_rows: Vec<Vec<URow>> = (0..NP)
         .into_par_iter()
         .map(|p| {
             let tid = rayon::current_thread_index().unwrap_or(nthreads);
+            let ts0 = Instant::now();
             let mut scr = ss_scr[tid].lock().unwrap();
             let (cnt, ev, cl) = &mut *scr;
             // counting sort by 16 person-hash bits, then small sorts per bucket
@@ -1384,12 +1399,30 @@ fn main() {
                 }
                 unsafe { ev.set_len(n) };
             }
+            let ts1 = Instant::now();
+            PT[0].fetch_add((ts1 - ts0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             for b in 0..BB {
                 let (s0, s1) = (bstart[b] as usize, bstart[b + 1] as usize);
                 if s1 - s0 > 1 {
-                    ev[s0..s1].sort_unstable_by_key(|e| ((e.person as u128) << 32) | pl_ts(e.payload) as u128);
+                    let v = &mut ev[s0..s1];
+                    if v.len() <= 32 {
+                        // insertion sort by (person, ts)
+                        for i in 1..v.len() {
+                            let x = v[i];
+                            let kx = (x.person, pl_ts(x.payload));
+                            let mut j = i;
+                            while j > 0 && (v[j - 1].person, pl_ts(v[j - 1].payload)) > kx {
+                                v[j] = v[j - 1];
+                                j -= 1;
+                            }
+                            v[j] = x;
+                        }
+                    } else {
+                        v.sort_unstable_by_key(|e| ((e.person as u128) << 32) | pl_ts(e.payload) as u128);
+                    }
                 }
             }
+            let ts2 = Instant::now();
             let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
             cl.clear();
             cl.reserve(nc);
@@ -1398,6 +1431,9 @@ fn main() {
             }
             cl.sort_unstable_by_key(|c| ((bkt(c.person) as u128) << 96) | ((c.person as u128) << 32) | c.ts as u128);
             let pk = |h: u64| ((bkt(h) as u128) << 64) | h as u128;
+            let ts3 = Instant::now();
+            PT[1].fetch_add((ts2 - ts1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            PT[2].fetch_add((ts3 - ts2).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
             let mut accg = camp_accs[tid].lock().unwrap();
             if accg.is_empty() {
@@ -1544,7 +1580,7 @@ fn main() {
             rows
         })
         .collect();
-    log!("sessions");
+    log!("sessions: gather {:?} sort {:?} clicks {:?}", std::time::Duration::from_nanos(PT[0].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[1].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[2].load(std::sync::atomic::Ordering::Relaxed)));
 
     let mut camp = vec![[0u64; 4]; (ncamp + 1) * ndays];
     for m in &camp_accs {
