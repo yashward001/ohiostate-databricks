@@ -65,50 +65,71 @@ fn d2(b: &[u8], i: usize) -> Option<i64> {
     Some((a as i64) * 10 + c as i64)
 }
 
+const Y0: i64 = 1600;
+const NY: usize = 1000;
+const fn build_ydays() -> [i32; NY] {
+    let mut t = [0i32; NY];
+    let mut i = 0;
+    while i < NY {
+        let y = Y0 + i as i64 - 1;
+        // days from 1970-01-01 to Jan 1 of year (Y0 + i)
+        let yy = y + 1;
+        let yb = yy - 1;
+        let d = (yb * 365 + yb / 4 - yb / 100 + yb / 400) - (1969 * 365 + 1969 / 4 - 1969 / 100 + 1969 / 400);
+        t[i] = d as i32;
+        let _ = y;
+        i += 1;
+    }
+    t
+}
+static YDAYS: [i32; NY] = build_ydays();
+static MCUM: [[i32; 13]; 2] = [
+    [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
+    [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335],
+];
+static MDAYS: [[u8; 13]; 2] = [[0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]];
+
 /// Parse a ts field (unquoted). None = bad format. Huge F3 values -> Some(i64::MAX).
-#[inline]
+#[inline(always)]
 fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
-    if n == 0 {
-        return None;
-    }
     if n == 20 || n == 25 {
         if b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':' {
-            let y = d2(b, 0)? * 100 + d2(b, 2)?;
-            let mo = d2(b, 5)?;
-            let d = d2(b, 8)?;
-            let h = d2(b, 11)?;
-            let mi = d2(b, 14)?;
-            let s = d2(b, 17)?;
-            if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+            let g = |i: usize| b[i].wrapping_sub(b'0');
+            let (y0, y1, y2, y3) = (g(0), g(1), g(2), g(3));
+            let (m0, m1, d0, d1) = (g(5), g(6), g(8), g(9));
+            let (h0, h1, i0, i1, s0, s1) = (g(11), g(12), g(14), g(15), g(17), g(18));
+            if (y0 > 9) | (y1 > 9) | (y2 > 9) | (y3 > 9) | (m0 > 9) | (m1 > 9) | (d0 > 9) | (d1 > 9) | (h0 > 9) | (h1 > 9) | (i0 > 9) | (i1 > 9) | (s0 > 9) | (s1 > 9) {
                 return None;
             }
-            let dim = match mo {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                _ => {
-                    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                        29
-                    } else {
-                        28
-                    }
-                }
-            };
-            if d > dim {
+            let y = y0 as i64 * 1000 + y1 as i64 * 100 + y2 as i64 * 10 + y3 as i64;
+            let mo = (m0 * 10 + m1) as usize;
+            let d = (d0 * 10 + d1) as i64;
+            let h = (h0 * 10 + h1) as i64;
+            let mi = (i0 * 10 + i1) as i64;
+            let sc = (s0 * 10 + s1) as i64;
+            if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sc > 59 || d < 1 {
                 return None;
             }
-            let mut t = (days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s) * 1000;
+            let leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) as usize;
+            if d > MDAYS[leap][mo] as i64 {
+                return None;
+            }
+            let yd = if y >= Y0 && y < Y0 + NY as i64 { YDAYS[(y - Y0) as usize] as i64 } else { days_from_civil(y, 1, 1) };
+            let days = yd + MCUM[leap][mo] as i64 + d - 1;
+            let mut t = (days * 86400 + h * 3600 + mi * 60 + sc) * 1000;
             if n == 20 {
                 if b[19] != b'Z' {
                     return None;
                 }
             } else {
                 let sign = b[19];
-                if (sign != b'+' && sign != b'-') || b[22] != b':' {
+                let (a0, a1, c0, c1) = (g(20), g(21), g(23), g(24));
+                if (sign != b'+' && sign != b'-') || b[22] != b':' || (a0 > 9) | (a1 > 9) | (c0 > 9) | (c1 > 9) {
                     return None;
                 }
-                let oh = d2(b, 20)?;
-                let om = d2(b, 23)?;
+                let oh = (a0 * 10 + a1) as i64;
+                let om = (c0 * 10 + c1) as i64;
                 if oh > 23 || om > 59 {
                     return None;
                 }
@@ -121,6 +142,19 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
             }
             return Some(t);
         }
+    }
+    if n == 0 {
+        return None;
+    }
+    if n <= 18 {
+        let mut v: u64 = 0;
+        let mut bad = false;
+        for &c in b {
+            let x = c.wrapping_sub(b'0');
+            bad |= x > 9;
+            v = v * 10 + x as u64;
+        }
+        return if bad { None } else { Some(v as i64) };
     }
     let mut v: u64 = 0;
     let mut big = false;
@@ -703,43 +737,51 @@ fn main() {
         .into_par_iter()
         .map(|s| {
             let n: usize = ev_parts.iter().map(|c| c[s].len()).sum();
-            let mut loc: Vec<Ev> = Vec::with_capacity(n);
-            for c in ev_parts.iter() {
-                loc.extend_from_slice(&c[s]);
-            }
             let cap = (n + n / 2 + 16).next_power_of_two();
             let mask = cap - 1;
-            let mut tab = vec![u32::MAX; cap];
-            for i in 0..n {
-                let e = unsafe { loc.get_unchecked(i) };
-                let mut h = (e.eid as usize) & mask;
-                loop {
-                    let j = unsafe { *tab.get_unchecked(h) };
-                    if j == u32::MAX {
-                        tab[h] = i as u32;
-                        break;
-                    }
-                    let b = unsafe { loc.get_unchecked(j as usize) };
-                    if b.eid == e.eid {
-                        if e.ingest < b.ingest {
-                            tab[h] = i as u32;
+            // slot: (eid, chunk, idx); eid 0 = empty (hashes are odd)
+            let mut tab: Vec<(u64, u32, u32)> = vec![(0, 0, 0); cap];
+            for (ci, c) in ev_parts.iter().enumerate() {
+                for (ii, e) in c[s].iter().enumerate() {
+                    let mut h = (e.eid as usize) & mask;
+                    loop {
+                        let sl_ = unsafe { tab.get_unchecked_mut(h) };
+                        if sl_.0 == 0 {
+                            *sl_ = (e.eid, ci as u32, ii as u32);
+                            break;
                         }
-                        break;
+                        if sl_.0 == e.eid {
+                            let b = &ev_parts[sl_.1 as usize][s][sl_.2 as usize];
+                            if e.ingest < b.ingest {
+                                sl_.1 = ci as u32;
+                                sl_.2 = ii as u32;
+                            }
+                            break;
+                        }
+                        h = (h + 1) & mask;
                     }
-                    h = (h + 1) & mask;
                 }
             }
             let mut kept: Vec<Ke> = Vec::with_capacity(n);
-            for &j in &tab {
-                if j != u32::MAX {
-                    let e = unsafe { loc.get_unchecked(j as usize) };
-                    if pl_typ(e.payload) != 3 {
-                        kept.push(Ke { person: e.person, payload: e.payload, name: ((e.name as u64) << 16) | e.nlen as u64 });
+            for (ci, c) in ev_parts.iter().enumerate() {
+                for (ii, e) in c[s].iter().enumerate() {
+                    if pl_typ(e.payload) == 3 {
+                        continue;
+                    }
+                    let mut h = (e.eid as usize) & mask;
+                    loop {
+                        let sl_ = unsafe { tab.get_unchecked(h) };
+                        if sl_.0 == e.eid {
+                            if sl_.1 == ci as u32 && sl_.2 == ii as u32 {
+                                kept.push(Ke { person: e.person, payload: e.payload, name: ((e.name as u64) << 16) | e.nlen as u64 });
+                            }
+                            break;
+                        }
+                        h = (h + 1) & mask;
                     }
                 }
             }
             drop(tab);
-            drop(loc);
             const PF: usize = 16;
             for i in 0..kept.len().min(PF) {
                 link_tab.prefetch(kept[i].person);
@@ -810,13 +852,13 @@ fn main() {
             for c in &kept_parts {
                 ev.extend_from_slice(&c[p]);
             }
-            ev.sort_unstable_by_key(|e| (e.person, pl_ts(e.payload)));
+            ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | pl_ts(e.payload) as u128);
             let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
             let mut cl: Vec<Ck> = Vec::with_capacity(nc);
             for c in &ck_parts {
                 cl.extend_from_slice(&c[p]);
             }
-            cl.sort_unstable_by_key(|c| (c.person, c.ts));
+            cl.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
 
             let tid = rayon::current_thread_index().unwrap_or(nthreads);
             let mut accg = camp_accs[tid].lock().unwrap();
