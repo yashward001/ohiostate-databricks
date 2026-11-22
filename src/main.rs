@@ -757,18 +757,17 @@ fn pl_price(p: u64) -> u64 {
 }
 
 #[derive(Clone, Copy, Default)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 struct LSlot {
     key: u64,
     person: u64,
-    rname: u64, // root (person) name: ptr << 16 | len
-    oname: u64, // own name
 }
 
 /// Open-addressing table: user hash -> person hash (hash of the byte-wise min ID).
 struct LinkTable {
     cap: usize,
     slots: Vec<LSlot>, // key 0 = empty
+    rname: Vec<u64>,   // per slot: root (person) name, ptr << 16 | len
 
 }
 impl LinkTable {
@@ -999,6 +998,10 @@ fn main() {
             let p = std::alloc::alloc_zeroed(layout) as *mut LSlot;
             Vec::from_raw_parts(p, cap, cap)
         };
+        let rname: Vec<u64> = vec![0; cap];
+        let oname: Vec<u64> = vec![0; cap];
+        let rnp = rname.as_ptr() as usize;
+        let onp = oname.as_ptr() as usize;
         let parent: Vec<u32> = vec![0; cap]; // 0 = root, else parent slot + 1
         let best: Vec<u32> = vec![0; cap]; // 0 = none, else best slot + 1
         let sp = slots.as_mut_ptr() as usize;
@@ -1019,7 +1022,7 @@ fn main() {
                 if cur == 0 {
                     match a.compare_exchange(0, k, Relaxed, Relaxed) {
                         Ok(_) => {
-                            unsafe { (*sat(h)).oname = ((ptr as u64) << 16) | len as u64 };
+                            unsafe { *(onp as *mut u64).add(h) = ((ptr as u64) << 16) | len as u64 };
                             return h as u32;
                         }
                         Err(x) if x == k => return h as u32,
@@ -1065,7 +1068,7 @@ fn main() {
         });
         log!("  lk uf");
         let nm = |i: u32| unsafe {
-            let o = (*sat(i as usize)).oname;
+            let o = *(onp as *const u64).add(i as usize);
             sl((o >> 16) as usize, o as u16)
         };
         let relax_best = |u: u32| {
@@ -1092,11 +1095,9 @@ fn main() {
             let r = find(u);
             let bs = best_at(r as usize).load(Relaxed) - 1;
             unsafe {
-                let b = &*sat(bs as usize);
-                let (pk, on) = (b.key, b.oname);
-                let us = &mut *sat(u as usize);
-                us.person = pk;
-                us.rname = on;
+                let pk = (*sat(bs as usize)).key;
+                (*sat(u as usize)).person = pk;
+                *(rnp as *mut u64).add(u as usize) = *(onp as *const u64).add(bs as usize);
             }
         };
         edges.par_iter().for_each(|v| {
@@ -1107,7 +1108,8 @@ fn main() {
         });
         drop(parent);
         drop(best);
-        LinkTable { cap, slots }
+        drop(oname);
+        LinkTable { cap, slots, rname }
     };
     log!("links done");
 
@@ -1557,7 +1559,7 @@ fn main() {
                 }
                 let (name, nlen) = match link_tab.find(person) {
                     Some(h) => {
-                        let r = link_tab.slots[h].rname;
+                        let r = link_tab.rname[h];
                         ((r >> 16) as usize, r as u16)
                     }
                     None => {
