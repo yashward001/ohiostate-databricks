@@ -603,7 +603,11 @@ fn open_all(paths: &[PathBuf]) -> Vec<Mmap> {
             if len == 0 {
                 return None;
             }
-            unsafe { memmap2::MmapOptions::new().populate().map(&f).ok() }
+            // Lazy mapping: page-ins happen in parallel inside the scan instead of serially here.
+            if std::env::var("SS_POP").is_ok() {
+                return unsafe { memmap2::MmapOptions::new().populate().map(&f).ok() };
+            }
+            unsafe { memmap2::MmapOptions::new().map(&f).ok() }
         })
         .collect()
 }
@@ -968,31 +972,11 @@ fn main() {
 
     // ---- links (runs concurrently with event parsing)
     let lk_chunks = chunks(&lk_maps, 1 << 20);
-    let lk_parse = || -> Vec<Vec<(u64, u64, usize, u16, usize, u16)>> {
-    lk_chunks
-        .par_iter()
-        .map(|buf| {
-            let mut v: Vec<(u64, u64, usize, u16, usize, u16)> = Vec::with_capacity(buf.len() / 4 + 2);
-            let vb = v.as_mut_ptr();
-            let mut vn = 0usize;
-            scan::<2>(buf, |f| {
-                let (a, b) = (f[0], f[1]);
-                if !a.is_empty() && !b.is_empty() {
-                    unsafe { vb.add(vn).write((hb(a), hb(b), a.as_ptr() as usize, a.len() as u16, b.as_ptr() as usize, b.len() as u16)) };
-                    vn += 1;
-                }
-            });
-            unsafe { v.set_len(vn) };
-            v
-        })
-        .collect()
-    };
     let links_job = || -> LinkTable {
-        let lk_pairs = lk_parse();
-        log!("  lk parse");
-        let n: usize = lk_pairs.iter().map(|v| v.len()).sum();
+        // Upper bound on link lines (every line is newline-terminated or ends a chunk).
+        let n: usize = lk_chunks.par_iter().map(|b| memchr::memchr_iter(b'\n', b).count() + 1).sum();
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-        let cap = n * 3 + 64; // ~2x the expected distinct IDs
+        let cap = n * 2 + 64; // > the most distinct IDs n lines can hold, so probing always ends
         let mut slots: Vec<LSlot> = unsafe {
             let layout = std::alloc::Layout::array::<LSlot>(cap).unwrap();
             let p = std::alloc::alloc_zeroed(layout) as *mut LSlot;
@@ -1035,9 +1019,23 @@ fn main() {
                 }
             }
         };
-        let edges: Vec<Vec<(u32, u32)>> = lk_pairs
+        let edges: Vec<Vec<(u32, u32)>> = lk_chunks
             .par_iter()
-            .map(|v| v.iter().map(|&(ha, hbb, pa, la, pb, lb)| (insert(ha, pa, la), insert(hbb, pb, lb))).collect())
+            .map(|buf| {
+                let mut v: Vec<(u32, u32)> = Vec::with_capacity(buf.len() / 4 + 2);
+                let vb = v.as_mut_ptr();
+                let mut vn = 0usize;
+                scan::<2>(buf, |f| {
+                    let (a, b) = (f[0], f[1]);
+                    if !a.is_empty() && !b.is_empty() {
+                        let e = (insert(hb(a), a.as_ptr() as usize, a.len() as u16), insert(hb(b), b.as_ptr() as usize, b.len() as u16));
+                        unsafe { vb.add(vn).write(e) };
+                        vn += 1;
+                    }
+                });
+                unsafe { v.set_len(vn) };
+                v
+            })
             .collect();
         log!("  lk intern");
         let find = |mut x: u32| -> u32 {
