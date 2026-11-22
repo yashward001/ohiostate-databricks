@@ -9,6 +9,7 @@ arrow-schema = "55"
 foldhash = "0.2.0"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
+mimalloc = "0.1.52"
 parquet = { version = "55", default-features = false, features = ["arrow"] }
 rayon = "1.12.0"
 
