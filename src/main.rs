@@ -1831,7 +1831,7 @@ fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp:
             }
             // Small row groups, written as they fill: the builders and the writer's page
             // buffers stay a few MB instead of holding the whole file in fresh memory.
-            const RG: usize = 1 << 16;
+            const RG: usize = 1 << 14;
             let f = fs::File::create(ud.join(format!("part-{gi}.parquet"))).unwrap();
             let mut w: Option<ArrowWriter<fs::File>> = None;
             let mut left = n;
