@@ -1,2 +1,3 @@
 target
 vendor
+src/bin/bench.rs

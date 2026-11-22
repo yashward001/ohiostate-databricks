@@ -24,7 +24,7 @@ type FHash = foldhash::quality::FixedState;
 fn hb(b: &[u8]) -> u64 {
     use std::hash::BuildHasher;
     const H: FHash = FHash::with_seed(0x243f6a8885a308d3);
-    H.hash_one(b)
+    H.hash_one(b) | 1
 }
 
 const NS: usize = 256; // event-id shards
@@ -44,7 +44,7 @@ const GAP_MS: u32 = 1_800_000;
 
 // ---------------------------------------------------------------- timestamps
 
-#[inline]
+#[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -55,7 +55,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-#[inline]
+#[inline(always)]
 fn d2(b: &[u8], i: usize) -> Option<i64> {
     let a = b[i].wrapping_sub(b'0');
     let c = b[i + 1].wrapping_sub(b'0');
@@ -375,8 +375,7 @@ struct Ev {
 struct Ke {
     person: u64,
     payload: u64,
-    name: usize,
-    nlen: u16,
+    name: u64, // ptr << 16 | len
 }
 
 #[derive(Clone, Copy)]
@@ -406,10 +405,46 @@ fn pl_price(p: u64) -> u64 {
     p >> 40
 }
 
-struct LinkInfo {
-    person: u64,
-    name: usize,
-    nlen: u16,
+/// Open-addressing table: user hash -> person hash (hash of the byte-wise min ID).
+struct LinkTable {
+    mask: usize,
+    slots: Vec<(u64, u64)>, // (key, person); key 0 = empty
+    names: Vec<(usize, u16)>,
+}
+impl LinkTable {
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        (k as usize) & self.mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn find(&self, k: u64) -> Option<usize> {
+        let mut h = self.slot(k);
+        loop {
+            let kk = unsafe { self.slots.get_unchecked(h).0 };
+            if kk == k {
+                return Some(h);
+            }
+            if kk == 0 {
+                return None;
+            }
+            h = (h + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn person(&self, k: u64) -> u64 {
+        match self.find(k) {
+            Some(h) => self.slots[h].1,
+            None => k,
+        }
+    }
 }
 
 fn manifest_ts(s: &str, key: &str) -> i64 {
@@ -541,9 +576,10 @@ fn main() {
     let ncamp = camp_ids.len();
     let organic = ncamp;
 
-    // ---- links
+    // ---- links (runs concurrently with event parsing)
     let lk_chunks = chunks(&lk_maps, 1 << 20);
-    let lk_pairs: Vec<Vec<(u64, u64, usize, u16, usize, u16)>> = lk_chunks
+    let lk_parse = || -> Vec<Vec<(u64, u64, usize, u16, usize, u16)>> {
+    lk_chunks
         .par_iter()
         .map(|buf| {
             let mut v = Vec::with_capacity(buf.len() / 20);
@@ -555,8 +591,10 @@ fn main() {
             });
             v
         })
-        .collect();
-    let link_map: HashMap<u64, LinkInfo, BuildNoHash> = {
+        .collect()
+    };
+    let links_job = || -> LinkTable {
+        let lk_pairs = lk_parse();
         let n: usize = lk_pairs.iter().map(|v| v.len()).sum();
         let mut idx: HashMap<u64, u32, BuildNoHash> = HashMap::with_capacity_and_hasher(n, BuildNoHash);
         let mut names: Vec<(usize, u16)> = Vec::with_capacity(n);
@@ -591,19 +629,25 @@ fn main() {
                 }
             }
         }
-        let mut m: HashMap<u64, LinkInfo, BuildNoHash> = HashMap::with_capacity_and_hasher(nu, BuildNoHash);
+        let cap = (nu * 2).next_power_of_two().max(16);
+        let mut t = LinkTable { mask: cap - 1, slots: vec![(0, 0); cap], names: vec![(0, 0); cap] };
         for u in 0..nu as u32 {
             let r = find(&mut parent, u);
-            let (p, l) = names[r as usize];
-            m.insert(hashes[u as usize], LinkInfo { person: hashes[r as usize], name: p, nlen: l });
+            let k = hashes[u as usize];
+            let mut h = t.slot(k);
+            while t.slots[h].0 != 0 {
+                h = (h + 1) & t.mask;
+            }
+            t.slots[h] = (k, hashes[r as usize]);
+            t.names[h] = names[u as usize];
         }
-        m
+        t
     };
-    log!("links: {} ids", link_map.len());
+    log!("links done");
 
     // ---- events: parse
     let ev_chunks = chunks(&ev_maps, 8 << 20);
-    let ev_parts: Vec<Vec<Vec<Ev>>> = ev_chunks
+    let ev_job = || -> Vec<Vec<Vec<Ev>>> { ev_chunks
         .par_iter()
         .map(|buf| {
             let mut parts: Vec<Vec<Ev>> = new_parts(NS, buf.len() / 85 / NS + 16);
@@ -638,14 +682,9 @@ fn main() {
                                 }
                             }
                             if ok {
-                                let uh = hb(user);
-                                let (person, name, nlen) = match link_map.get(&uh) {
-                                    Some(li) => (li.person, li.name, li.nlen),
-                                    None => (uh, user.as_ptr() as usize, user.len() as u16),
-                                };
-                                e.person = person;
-                                e.name = name;
-                                e.nlen = nlen;
+                                e.person = hb(user);
+                                e.name = user.as_ptr() as usize;
+                                e.nlen = user.len() as u16;
                                 e.payload = ((t - ws) as u64) | (typ << 31) | extra;
                             }
                         }
@@ -655,53 +694,69 @@ fn main() {
             });
             parts
         })
-        .collect();
-    log!("parse events: {} chunks", ev_chunks.len());
+        .collect() };
+    let (link_tab, ev_parts) = rayon::join(links_job, ev_job);
+    log!("links + parse events: {} chunks", ev_chunks.len());
 
     // ---- dedup per event shard, emit kept events partitioned by person
     let kept_parts: Vec<Vec<Vec<Ke>>> = (0..NS)
         .into_par_iter()
         .map(|s| {
             let n: usize = ev_parts.iter().map(|c| c[s].len()).sum();
-            let cap = (n * 2).next_power_of_two().max(16);
+            let mut loc: Vec<Ev> = Vec::with_capacity(n);
+            for c in ev_parts.iter() {
+                loc.extend_from_slice(&c[s]);
+            }
+            let cap = (n + n / 2 + 16).next_power_of_two();
             let mask = cap - 1;
-            let mut keys = vec![0u64; cap];
-            let mut vals = vec![(0u32, 0u32); cap];
-            for (ci, c) in ev_parts.iter().enumerate() {
-                for (ii, e) in c[s].iter().enumerate() {
-                    let k = e.eid | 1;
-                    let mut h = (e.eid as usize) & mask;
-                    loop {
-                        let kk = keys[h];
-                        if kk == 0 {
-                            keys[h] = k;
-                            vals[h] = (ci as u32, ii as u32);
-                            break;
+            let mut tab = vec![u32::MAX; cap];
+            for i in 0..n {
+                let e = unsafe { loc.get_unchecked(i) };
+                let mut h = (e.eid as usize) & mask;
+                loop {
+                    let j = unsafe { *tab.get_unchecked(h) };
+                    if j == u32::MAX {
+                        tab[h] = i as u32;
+                        break;
+                    }
+                    let b = unsafe { loc.get_unchecked(j as usize) };
+                    if b.eid == e.eid {
+                        if e.ingest < b.ingest {
+                            tab[h] = i as u32;
                         }
-                        if kk == k {
-                            let (bc, bi) = vals[h];
-                            if e.ingest < ev_parts[bc as usize][s][bi as usize].ingest {
-                                vals[h] = (ci as u32, ii as u32);
-                            }
-                            break;
-                        }
-                        h = (h + 1) & mask;
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
+            let mut kept: Vec<Ke> = Vec::with_capacity(n);
+            for &j in &tab {
+                if j != u32::MAX {
+                    let e = unsafe { loc.get_unchecked(j as usize) };
+                    if pl_typ(e.payload) != 3 {
+                        kept.push(Ke { person: e.person, payload: e.payload, name: ((e.name as u64) << 16) | e.nlen as u64 });
                     }
                 }
             }
+            drop(tab);
+            drop(loc);
+            const PF: usize = 16;
+            for i in 0..kept.len().min(PF) {
+                link_tab.prefetch(kept[i].person);
+            }
             let mut outp: Vec<Vec<Ke>> = new_parts(NP, n / NP + 8);
-            for h in 0..cap {
-                if keys[h] != 0 {
-                    let (bc, bi) = vals[h];
-                    let e = &ev_parts[bc as usize][s][bi as usize];
-                    if pl_typ(e.payload) != 3 {
-                        outp[pshard(e.person)].push(Ke { person: e.person, payload: e.payload, name: e.name, nlen: e.nlen });
-                    }
+            for i in 0..kept.len() {
+                if i + PF < kept.len() {
+                    link_tab.prefetch(kept[i + PF].person);
                 }
+                let mut k = kept[i];
+                k.person = link_tab.person(k.person);
+                outp[pshard(k.person)].push(k);
             }
             outp
         })
         .collect();
+    drop(ev_parts);
     log!("dedup");
 
     // ---- clicks
@@ -710,6 +765,7 @@ fn main() {
         .par_iter()
         .map(|buf| {
             let mut parts: Vec<Vec<Ck>> = new_parts(NP, buf.len() / 50 / NP + 16);
+            let mut raw: Vec<Ck> = Vec::with_capacity(buf.len() / 45);
             scan::<4>(buf, |f| {
                 let (cid, user, camp, ts) = (f[0], f[1], f[2], f[3]);
                 if cid.is_empty() || user.is_empty() {
@@ -720,13 +776,20 @@ fn main() {
                     return;
                 }
                 let Some(&ci) = camp_map.get(&hb(camp)) else { return };
-                let uh = hb(user);
-                let person = match link_map.get(&uh) {
-                    Some(li) => li.person,
-                    None => uh,
-                };
-                parts[pshard(person)].push(Ck { person, ts: (t - cws) as u32, camp: ci, clen: cid.len() as u16, cid: cid.as_ptr() as usize });
+                raw.push(Ck { person: hb(user), ts: (t - cws) as u32, camp: ci, clen: cid.len() as u16, cid: cid.as_ptr() as usize });
             });
+            const PF: usize = 16;
+            for i in 0..raw.len().min(PF) {
+                link_tab.prefetch(raw[i].person);
+            }
+            for i in 0..raw.len() {
+                if i + PF < raw.len() {
+                    link_tab.prefetch(raw[i + PF].person);
+                }
+                let mut c = raw[i];
+                c.person = link_tab.person(c.person);
+                parts[pshard(c.person)].push(c);
+            }
             parts
         })
         .collect();
@@ -771,7 +834,10 @@ fn main() {
             let mut i = 0usize;
             while i < ev.len() {
                 let person = ev[i].person;
-                let (name, nlen) = (ev[i].name, ev[i].nlen);
+                let (name, nlen) = match link_tab.find(person) {
+                    Some(h) => link_tab.names[h],
+                    None => ((ev[i].name >> 16) as usize, ev[i].name as u16),
+                };
                 let mut j = i + 1;
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
