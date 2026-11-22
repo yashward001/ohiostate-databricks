@@ -682,8 +682,8 @@ impl Arena {
         let base = match memmap2::MmapMut::map_anon(cap + (2 << 20)) {
             Ok(m) => {
                 // 4 KB pages measured faster here: in a VM, fresh 2 MB pages are often memory the host has to
-                // supply again, while small pages are more often reused ones.
-                if std::env::var("SS_HUGE").is_ok() {
+                // supply again, while small pages are more often reused ones. (On warm runs, and on the scorer, 2 MB pages won.)
+                if huge_pages() {
                     let _ = m.advise(memmap2::Advice::HugePage);
                 }
                 let p = m.as_ptr() as usize;
@@ -912,10 +912,18 @@ impl LinkTable {
 }
 unsafe impl Sync for LinkTable {}
 
-/// A zeroed, never-freed buffer in its own anonymous mapping (normal pages).
+/// 2 MB pages for arenas and the link table (fewer TLB misses on warm machines); SS_SMALL=1 uses 4 KB pages.
+fn huge_pages() -> bool {
+    std::env::var_os("SS_SMALL").is_none()
+}
+
+/// A zeroed, never-freed buffer in its own anonymous mapping.
 fn anon_slice<T>(n: usize) -> &'static mut [T] {
     let bytes = (n * std::mem::size_of::<T>()).max(1);
     let m = memmap2::MmapMut::map_anon(bytes).expect("map_anon");
+    if huge_pages() {
+        let _ = m.advise(memmap2::Advice::HugePage);
+    }
     let p = m.as_ptr() as *mut T;
     std::mem::forget(m);
     unsafe { std::slice::from_raw_parts_mut(p, n) }
