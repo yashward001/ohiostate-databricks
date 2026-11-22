@@ -1325,7 +1325,7 @@ fn main() {
             unsafe { stg.set_len(sn) };
             let n = stg.len();
             let tp1 = Instant::now();
-            const PF: usize = 16;
+            const PF: usize = 32;
             for i in 0..n.min(PF) {
                 link_tab.prefetch2(stg[i].person);
             }
@@ -1523,7 +1523,7 @@ fn main() {
             });
             unsafe { raw.set_len(rn) };
             PT[3].fetch_add(tc0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            const PF: usize = 16;
+            const PF: usize = 32;
             for i in 0..raw.len().min(PF) {
                 link_tab.prefetch(raw[i].person);
             }
