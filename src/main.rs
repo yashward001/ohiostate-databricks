@@ -707,13 +707,48 @@ impl Arena {
     }
 }
 
-/// Dedup key: eid hash, ingest, location of the kept candidate (pshard<<24|idx, MAX = invalid).
+/// Dedup key, 12 bytes: a = eid hash bits 0..54 | ig bits 0..10 << 54; b = ig bits 10..21 | loc << 11.
+/// The hash's top 10 bits pick the shard, so all 64 are compared. ig = ingest seconds + 2 days relative to
+/// the window start; 0 and IG_HI mean out of that range, and the exact value is in the chunk's side list.
+/// loc = index of the kept candidate in its chunk (DD_INV = never kept).
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed)]
 struct Dd {
-    eid: u64,
-    ingest: i32,
-    loc: u32,
+    a: u64,
+    b: u32,
+}
+const DD_INV: u32 = (1 << 21) - 1;
+const M54: u64 = (1 << 54) - 1;
+const IG_OFF: i64 = 2 * 86_400;
+const IG_HI: u32 = (1 << 21) - 1;
+impl Dd {
+    #[inline(always)]
+    fn new(eid: u64, ig: u32, loc: u32) -> Dd {
+        Dd { a: (eid & M54) | (((ig & 1023) as u64) << 54), b: (ig >> 10) | (loc << 11) }
+    }
+    #[inline(always)]
+    fn key(&self) -> u64 {
+        self.a & M54
+    }
+    #[inline(always)]
+    fn ig(&self) -> u32 {
+        ((self.a >> 54) as u32) | ((self.b & 2047) << 10)
+    }
+    #[inline(always)]
+    fn loc(&self) -> u32 {
+        self.b >> 11
+    }
+}
+#[inline(always)]
+fn ig_pack(ingest: i32, narrow: bool) -> u32 {
+    let r = ingest as i64 + IG_OFF;
+    if narrow || r >= IG_HI as i64 {
+        IG_HI
+    } else if r < 1 {
+        0
+    } else {
+        r as u32
+    }
 }
 
 /// Kept event: pidx << 32 | ts_rel << 1 | is_purchase (ts_rel all ones = dropped by dedup).
@@ -1214,10 +1249,11 @@ fn main() {
     let link_tab = links_job(extra);
     log!("links");
     let ke_arena = Arena::new(ev_bytes / 30 * (std::mem::size_of::<Ke>() + 1) + (8 << 20));
-    let dd_arena = Arena::new(ev_bytes / 30 * std::mem::size_of::<Dd>() + (8 << 20));
+    let dd_arena = Arena::new(ev_bytes / 30 * 16 + (8 << 20)); // 16: clicks reuse it after dedup
+    let narrow = std::env::var("SS_IGSIDE").is_ok(); // testing: every ingest via the side lists
     let st_scr: Vec<Mutex<Vec<Ev>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
     #[allow(clippy::type_complexity)]
-    let parsed: Vec<(Parts<Ke, { NP + 1 }>, Parts<u32, { NP + 1 }>, Parts<Dd, { NS + 1 }>)> = ev_chunks
+    let parsed: Vec<(Parts<Ke, { NP + 1 }>, Parts<u32, { NP + 1 }>, Parts<Dd, { NS + 1 }>, Vec<(u32, i32)>)> = ev_chunks
         .par_iter()
         .map(|buf| {
             let tid = rayon::current_thread_index().unwrap_or(nthr - 1);
@@ -1331,9 +1367,11 @@ fn main() {
             let kq: *mut Ke = ke_arena.alloc(nk);
             let pq: *mut u32 = ke_arena.alloc(pc[NP] as usize);
             let dq: *mut Dd = dd_arena.alloc(nd);
+            assert!(nk < DD_INV as usize);
+            let mut side: Vec<(u32, i32)> = Vec::new();
             unsafe {
                 for e in stg.iter() {
-                    let mut loc = u32::MAX;
+                    let mut loc = DD_INV;
                     let typ = pl_typ(e.payload);
                     if typ != 3 {
                         let ps = e.person as usize & (NP - 1);
@@ -1347,15 +1385,20 @@ fn main() {
                         }
                     }
                     let es = eshard(e.eid);
-                    dq.add(dc[es] as usize).write(Dd { eid: e.eid, ingest: e.ingest, loc });
+                    let ig = ig_pack(e.ingest, narrow);
+                    if ig == 0 || ig == IG_HI {
+                        side.push((dc[es], e.ingest));
+                    }
+                    dq.add(dc[es] as usize).write(Dd::new(e.eid, ig, loc));
                     dc[es] += 1;
                 }
             }
+            side.sort_unstable_by_key(|x| x.0);
             let tp3 = Instant::now();
             PT[0].fetch_add((tp1 - tp0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             PT[1].fetch_add((tp2 - tp1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             PT[2].fetch_add((tp3 - tp2).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            (Parts { ptr: kq, off: koff }, Parts { ptr: pq, off: poff }, Parts { ptr: dq, off: doff })
+            (Parts { ptr: kq, off: koff }, Parts { ptr: pq, off: poff }, Parts { ptr: dq, off: doff }, side)
         })
         .collect();
     log!("parse events: {} chunks  scan {:?} resolve {:?} write {:?}", ev_chunks.len(), std::time::Duration::from_nanos(PT[0].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[1].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[2].load(std::sync::atomic::Ordering::Relaxed)));
@@ -1374,20 +1417,34 @@ fn main() {
     let mut kept_parts: Vec<Parts<Ke, { NP + 1 }>> = Vec::with_capacity(parsed.len());
     let mut pur_parts: Vec<Parts<u32, { NP + 1 }>> = Vec::with_capacity(parsed.len());
     let mut dd_parts: Vec<Parts<Dd, { NS + 1 }>> = Vec::with_capacity(parsed.len());
-    for (k, q, d) in parsed {
+    let mut sides: Vec<Vec<(u32, i32)>> = Vec::with_capacity(parsed.len());
+    for (k, q, d, sd) in parsed {
         kept_parts.push(k);
         pur_parts.push(q);
         dd_parts.push(d);
+        sides.push(sd);
     }
     let kptr: Vec<usize> = kept_parts.iter().map(|c| c.ptr as usize).collect();
     {
         let dd_scr: Vec<Mutex<Vec<(u64, u32, u32)>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
         let kptr = &kptr;
         let dd_parts = &dd_parts;
+        let sides = &sides;
+        // exact ingest of copy ii of shard s in chunk ci
+        let exact = |ci: usize, s: usize, ii: usize, d: &Dd| -> i64 {
+            let g = d.ig();
+            if g != 0 && g != IG_HI {
+                return g as i64 - IG_OFF;
+            }
+            let pos = dd_parts[ci].off[s] + ii as u32;
+            let sd = &sides[ci];
+            sd[sd.binary_search_by_key(&pos, |x| x.0).unwrap()].1 as i64
+        };
         let kill = |ci: usize, d: &Dd| {
-            if d.loc != u32::MAX {
+            let loc = d.loc();
+            if loc != DD_INV {
                 unsafe {
-                    let k = (kptr[ci] as *mut Ke).add(d.loc as usize);
+                    let k = (kptr[ci] as *mut Ke).add(loc as usize);
                     *k |= KE_DEAD;
                 }
             }
@@ -1402,17 +1459,21 @@ fn main() {
             tab.resize(cap, (0, 0, 0));
             for (ci, c) in dd_parts.iter().enumerate() {
                 for (ii, d) in c[s].iter().enumerate() {
-                    let mut h = (d.eid as usize) & mask;
+                    let key = d.key();
+                    let mut h = (key as usize) & mask;
                     loop {
                         let sl_ = unsafe { tab.get_unchecked_mut(h) };
                         if sl_.0 == 0 {
-                            *sl_ = (d.eid, ci as u32, ii as u32);
+                            *sl_ = (key, ci as u32, ii as u32);
                             break;
                         }
-                        if sl_.0 == d.eid {
+                        if sl_.0 == key {
                             let bc = sl_.1 as usize;
-                            let b = &dd_parts[bc][s][sl_.2 as usize];
-                            if d.ingest < b.ingest {
+                            let bi = sl_.2 as usize;
+                            let b = &dd_parts[bc][s][bi];
+                            let (gd, gb) = (d.ig(), b.ig());
+                            let less = if gd != 0 && gd != IG_HI && gb != 0 && gb != IG_HI { gd < gb } else { exact(ci, s, ii, d) < exact(bc, s, bi, b) };
+                            if less {
                                 kill(bc, b);
                                 sl_.1 = ci as u32;
                                 sl_.2 = ii as u32;
