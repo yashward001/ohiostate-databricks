@@ -1027,31 +1027,45 @@ fn main() {
     // ---- products / campaigns
     let prod_raw = read_small(&data.join("products.csv"));
     let camp_raw = read_small(&data.join("campaigns.csv"));
-    let mut cat_names: Vec<Vec<u8>> = Vec::new();
-    let mut prod_pairs: Vec<(&[u8], &[u8])> = Vec::new();
+    // Categories are few: find each line's in a short list instead of allocating per product
+    // (fresh memory is costly when the machine is cold).
+    let mut cats: Vec<&[u8]> = Vec::new();
+    let mut prod_tmp: Vec<(u64, u8)> = Vec::new();
     {
         let body = match memchr::memchr(b'\n', &prod_raw) {
             Some(p) => &prod_raw[p + 1..],
             None => &[][..],
         };
+        prod_tmp.reserve(memchr::memchr_iter(b'\n', body).count() + 1);
         scan::<2>(body, |f| {
-            prod_pairs.push((f[0], f[1]));
-            cat_names.push(f[1].to_vec());
+            let c = match cats.iter().position(|x| *x == f[1]) {
+                Some(i) => i,
+                None => {
+                    cats.push(f[1]);
+                    assert!(cats.len() <= 127);
+                    cats.len() - 1
+                }
+            };
+            prod_tmp.push((hb(f[0]), c as u8));
         });
     }
+    let mut cat_names: Vec<Vec<u8>> = cats.iter().map(|c| c.to_vec()).collect();
     cat_names.push(b"unknown".to_vec());
     cat_names.sort();
     cat_names.dedup();
     assert!(cat_names.len() <= 127);
-    let cat_idx: HashMap<&[u8], u8> = cat_names.iter().enumerate().map(|(i, c)| (c.as_slice(), i as u8)).collect();
-    let unknown_cat = cat_idx[&b"unknown"[..]];
+    let gidx = |c: &[u8]| cat_names.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u8;
+    let remap: Vec<u8> = cats.iter().map(|c| gidx(c)).collect();
+    let unknown_cat = gidx(b"unknown");
     let prod_map: HashMap<u64, u8, BuildNoHash> = {
-        let mut m = HashMap::with_capacity_and_hasher(prod_pairs.len(), BuildNoHash);
-        for (p, c) in &prod_pairs {
-            m.insert(hb(p), cat_idx[c]);
+        let mut m = HashMap::with_capacity_and_hasher(prod_tmp.len(), BuildNoHash);
+        for &(h, c) in &prod_tmp {
+            m.insert(h, remap[c as usize]);
         }
         m
     };
+    drop(prod_tmp);
+    log!("products");
     let mut camp_ids: Vec<Vec<u8>> = Vec::new();
     let mut camp_chan: Vec<Vec<u8>> = Vec::new();
     {
