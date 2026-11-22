@@ -803,7 +803,7 @@ fn pl_price(p: u64) -> u64 {
 #[repr(C, align(16))]
 struct LSlot {
     key: u64,
-    person: u64, // 0 = the ID is its own person, else the person's slot + 1
+    person: u64, // high 32 bits: 0 = the ID is its own person, else the person's slot + 1 (low 32: link-build scratch)
 }
 
 /// Open-addressing table over every user ID seen (linked IDs first, then event IDs as they come).
@@ -821,7 +821,7 @@ struct LinkTable {
 impl LinkTable {
     #[inline(always)]
     fn pidx_at(&self, h: usize) -> u32 {
-        let p = unsafe { (*(self.sp as *const LSlot).add(h)).person };
+        let p = unsafe { (*(self.sp as *const LSlot).add(h)).person } >> 32;
         if p == 0 { h as u32 } else { (p - 1) as u32 }
     }
     /// Person number of the ID with hash k, adding the ID as its own person if new. Past the load limit it
@@ -1073,15 +1073,13 @@ fn main() {
         };
         let mut oname: Vec<u64> = vec![0; cap];
         let onp = oname.as_mut_ptr() as usize;
-        let parent: Vec<u32> = vec![0; cap]; // 0 = root, else parent slot + 1
-        let best: Vec<u32> = vec![0; cap]; // 0 = none, else best slot + 1
+        // Union-find state lives in each slot's person field: low half = parent (0 = root, else parent slot + 1),
+        // high half = a root's best (smallest-name) slot + 1, which becomes every member's person below.
         let sp = slots.as_mut_ptr() as usize;
-        let pp = parent.as_ptr() as usize;
-        let bp = best.as_ptr() as usize;
         let sat = |h: usize| unsafe { (sp as *mut LSlot).add(h) };
         let key_at = |h: usize| unsafe { AtomicU64::from_ptr(&raw mut (*sat(h)).key) };
-        let par_at = |h: usize| unsafe { AtomicU32::from_ptr((pp as *mut u32).add(h)) };
-        let best_at = |h: usize| unsafe { AtomicU32::from_ptr((bp as *mut u32).add(h)) };
+        let par_at = |h: usize| unsafe { AtomicU32::from_ptr((&raw mut (*sat(h)).person) as *mut u32) };
+        let best_at = |h: usize| unsafe { AtomicU32::from_ptr(((&raw mut (*sat(h)).person) as *mut u32).add(1)) };
         let insert = |k: u64, ptr: usize, len: u16| -> u32 {
             let mut h = ((k as u128 * cap as u128) >> 64) as usize;
             loop {
@@ -1179,9 +1177,7 @@ fn main() {
         let set_person = |u: u32| {
             let r = find(u);
             let bs = best_at(r as usize).load(Relaxed) - 1;
-            unsafe {
-                (*sat(u as usize)).person = bs as u64 + 1;
-            }
+            best_at(u as usize).store(bs + 1, Relaxed); // parents (low halves) stay intact for other finds
         };
         edges.par_iter().for_each(|v| {
             for &(a, b) in v {
@@ -1189,8 +1185,6 @@ fn main() {
                 set_person(b);
             }
         });
-        drop(parent);
-        drop(best);
         let used: usize = slots.par_chunks(1 << 16).map(|c| c.iter().filter(|s| s.key != 0).count()).sum();
         let sp = slots.as_mut_ptr() as usize;
         LinkTable { cap, slots, name: oname, sp, np: onp, used: used.into(), lim: cap / 100 * std::env::var("SS_LIMPCT").ok().and_then(|x| x.parse().ok()).unwrap_or(87), full: false.into() }
