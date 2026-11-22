@@ -1366,6 +1366,7 @@ fn main() {
         });
     }
     drop(dd_parts);
+    let dd_hw = dd_arena.off.load(std::sync::atomic::Ordering::Relaxed).min(dd_arena.cap); // touched extent
     dd_arena.reset(); // reuse the already-touched dedup memory for clicks
     log!("dedup");
 
@@ -1448,6 +1449,17 @@ fn main() {
     }
     let ss_scr: Vec<Mutex<(Vec<u32>, Vec<KeS>, Vec<Ck>)>> = (0..nthreads + 1).map(|_| Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
     let rows_scr: Vec<Mutex<Vec<URow>>> = (0..nthreads + 1).map(|_| Mutex::new(Vec::new())).collect();
+    // Per-thread sort scratch carved from the dedup memory that is already touched (fresh pages are costly);
+    // each region fits the largest shard if there is room, else shards that do not fit use the Vec scratch.
+    let scr_need = |p: usize| -> usize {
+        let n: usize = kept_parts.iter().map(|c| c[p].len()).sum();
+        let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
+        n * std::mem::size_of::<KeS>() + nc * std::mem::size_of::<Ck>() + 64
+    };
+    let max_need = (0..NP).into_par_iter().map(scr_need).max().unwrap_or(0);
+    let warm_left = dd_hw.saturating_sub(dd_arena.off.load(std::sync::atomic::Ordering::Relaxed));
+    let region = max_need.min(warm_left / 2 / (nthreads + 1)) & !63;
+    let regions: Vec<std::sync::atomic::AtomicUsize> = (0..nthreads + 1).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
     let user_rows: Vec<&[URow]> = (0..NP)
         .into_par_iter()
         .map(|p| {
@@ -1463,6 +1475,7 @@ fn main() {
             }
             cnt.clear();
             cnt.resize(BB + 1, 0);
+            let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
             let mut n = 0usize;
             for c in &kept_parts {
                 for e in &c[p] {
@@ -1475,10 +1488,23 @@ fn main() {
                 cnt[b + 1] += cnt[b];
             }
             let bstart = cnt.clone();
-            ev.clear();
-            ev.reserve(n);
+            let need = n * std::mem::size_of::<KeS>() + nc * std::mem::size_of::<Ck>() + 64;
+            let (evp, clp): (*mut KeS, *mut Ck) = if region > 0 && need <= region {
+                let mut r = regions[tid].load(std::sync::atomic::Ordering::Relaxed);
+                if r == 0 {
+                    r = dd_arena.alloc::<u8>(region) as usize;
+                    regions[tid].store(r, std::sync::atomic::Ordering::Relaxed);
+                }
+                (r as *mut KeS, ((r + n * std::mem::size_of::<KeS>() + 63) & !63) as *mut Ck)
+            } else {
+                ev.clear();
+                ev.reserve(n);
+                cl.clear();
+                cl.reserve(nc);
+                (ev.as_mut_ptr(), cl.as_mut_ptr())
+            };
             {
-                let ptr = ev.as_mut_ptr();
+                let ptr = evp;
                 for (ci, c) in kept_parts.iter().enumerate() {
                     let base = chunk_base[ci];
                     for e in &c[p] {
@@ -1493,8 +1519,8 @@ fn main() {
                         cnt[b] += 1;
                     }
                 }
-                unsafe { ev.set_len(n) };
             }
+            let ev: &mut [KeS] = unsafe { std::slice::from_raw_parts_mut(evp, n) };
             let ts1 = Instant::now();
             PT[0].fetch_add((ts1 - ts0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             for b in 0..BB {
@@ -1519,12 +1545,15 @@ fn main() {
                 }
             }
             let ts2 = Instant::now();
-            let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
-            cl.clear();
-            cl.reserve(nc);
-            for c in &ck_parts {
-                cl.extend_from_slice(&c[p]);
-            }
+            let cl: &mut [Ck] = unsafe {
+                let mut o = 0usize;
+                for c in &ck_parts {
+                    let x = &c[p];
+                    std::ptr::copy_nonoverlapping(x.as_ptr(), clp.add(o), x.len());
+                    o += x.len();
+                }
+                std::slice::from_raw_parts_mut(clp, nc)
+            };
             cl.sort_unstable_by_key(|c| ((bkt(c.person) as u128) << 96) | ((c.person as u128) << 32) | c.ts as u128);
             let pk = |h: u64| ((bkt(h) as u128) << 64) | h as u128;
             let ts3 = Instant::now();
