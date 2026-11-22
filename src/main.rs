@@ -848,17 +848,47 @@ fn main() {
         .into_par_iter()
         .map(|p| {
             let n: usize = kept_parts.iter().map(|c| c[p].len()).sum();
-            let mut ev: Vec<Ke> = Vec::with_capacity(n);
-            for c in &kept_parts {
-                ev.extend_from_slice(&c[p]);
+            // counting sort by 16 person-hash bits, then small sorts per bucket
+            const BB: usize = 1 << 14;
+            #[inline(always)]
+            fn bkt(h: u64) -> usize {
+                ((h >> 20) as usize) & (BB - 1)
             }
-            ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | pl_ts(e.payload) as u128);
+            let mut cnt = vec![0u32; BB + 1];
+            for c in &kept_parts {
+                for e in &c[p] {
+                    cnt[bkt(e.person) + 1] += 1;
+                }
+            }
+            for b in 0..BB {
+                cnt[b + 1] += cnt[b];
+            }
+            let bstart = cnt.clone();
+            let mut ev: Vec<Ke> = Vec::with_capacity(n);
+            {
+                let ptr = ev.as_mut_ptr();
+                for c in &kept_parts {
+                    for e in &c[p] {
+                        let b = bkt(e.person);
+                        unsafe { ptr.add(cnt[b] as usize).write(*e) };
+                        cnt[b] += 1;
+                    }
+                }
+                unsafe { ev.set_len(n) };
+            }
+            for b in 0..BB {
+                let (s0, s1) = (bstart[b] as usize, bstart[b + 1] as usize);
+                if s1 - s0 > 1 {
+                    ev[s0..s1].sort_unstable_by_key(|e| ((e.person as u128) << 32) | pl_ts(e.payload) as u128);
+                }
+            }
             let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
             let mut cl: Vec<Ck> = Vec::with_capacity(nc);
             for c in &ck_parts {
                 cl.extend_from_slice(&c[p]);
             }
-            cl.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
+            cl.sort_unstable_by_key(|c| ((bkt(c.person) as u128) << 96) | ((c.person as u128) << 32) | c.ts as u128);
+            let pk = |h: u64| ((bkt(h) as u128) << 64) | h as u128;
 
             let tid = rayon::current_thread_index().unwrap_or(nthreads);
             let mut accg = camp_accs[tid].lock().unwrap();
@@ -884,7 +914,7 @@ fn main() {
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
                 }
-                while cp < cl.len() && cl[cp].person < person {
+                while cp < cl.len() && pk(cl[cp].person) < pk(person) {
                     cp += 1;
                 }
                 let cs = cp;
