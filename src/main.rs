@@ -993,7 +993,7 @@ fn main() {
     }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     macro_rules! log {
-        ($($t:tt)*) => { if verbose { eprintln!("{:>8.1?} cpu {:>6.2}s anon {:>5}M {}", t0.elapsed(), proc_cpu(), rss_anon_mb(), format!($($t)*)); } };
+        ($($t:tt)*) => { if verbose { eprintln!("{:>8.1}ms cpu {:>6.2}s anon {:>5}M {}", t0.elapsed().as_secs_f64() * 1000.0, proc_cpu(), rss_anon_mb(), format!($($t)*)); } };
     }
 
     let man = String::from_utf8(read_small(&data.join("manifest.json"))).unwrap();
@@ -1854,6 +1854,15 @@ fn main() {
             }
         }
     }
+    log!("camp merge");
+    if let Some(k) = std::env::var("SS_WREP").ok().and_then(|x| x.parse::<usize>().ok()) {
+        for i in 0..k {
+            let t = Instant::now();
+            let c0 = proc_cpu();
+            write_outputs(&out.join(format!("rep{i}")), &user_rows, &cat_names, &camp, &camp_ids, &camp_chan, ndays, ws_day);
+            eprintln!("write rep {i}: {:.1} ms wall {:.3} cpu", t.elapsed().as_secs_f64() * 1e3, proc_cpu() - c0);
+        }
+    }
     write_outputs(&out, &user_rows, &cat_names, &camp, &camp_ids, &camp_chan, ndays, ws_day);
     log!("done");
     if verbose {
@@ -1981,7 +1990,20 @@ fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp:
                         .set_dictionary_enabled(false)
                         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
                         .set_max_row_group_size(RG)
-                        .build();
+                        // Compact encodings: rows of one person sit together (shared prefixes) and the
+                        // integers are small, so the file (fresh page-cache memory) is far smaller.
+                        ;
+                    let enc: u32 = std::env::var("SS_ENC").ok().and_then(|x| x.parse().ok()).unwrap_or(0); // plain measured fastest
+                    let pr = if enc >= 1 {
+                        pr.set_column_encoding("day".into(), parquet::basic::Encoding::DELTA_BINARY_PACKED)
+                            .set_column_encoding("sessions".into(), parquet::basic::Encoding::DELTA_BINARY_PACKED)
+                            .set_column_encoding("events".into(), parquet::basic::Encoding::DELTA_BINARY_PACKED)
+                            .set_column_encoding("revenue_cents".into(), parquet::basic::Encoding::DELTA_BINARY_PACKED)
+                    } else {
+                        pr
+                    };
+                    let pr = if enc >= 2 { pr.set_column_encoding("user_id".into(), parquet::basic::Encoding::DELTA_BYTE_ARRAY) } else { pr };
+                    let pr = pr.build();
                     w = Some(ArrowWriter::try_new(f.take().unwrap(), batch.schema(), Some(pr)).unwrap());
                 }
                 let wr = w.as_mut().unwrap();
