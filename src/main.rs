@@ -681,7 +681,9 @@ impl Arena {
         let cap = (cap + (2 << 20) - 1) & !((2 << 20) - 1);
         let base = match memmap2::MmapMut::map_anon(cap + (2 << 20)) {
             Ok(m) => {
-                if std::env::var("SS_NOHUGE").is_err() {
+                // 4 KB pages measured faster here: in a VM, fresh 2 MB pages are often memory the host has to
+                // supply again, while small pages are more often reused ones.
+                if std::env::var("SS_HUGE").is_ok() {
                     let _ = m.advise(memmap2::Advice::HugePage);
                 }
                 let p = m.as_ptr() as usize;
@@ -910,6 +912,20 @@ impl LinkTable {
 }
 unsafe impl Sync for LinkTable {}
 
+/// Touch every page of a fresh zeroed buffer, 2 MB per parallel task.
+fn prefault(p: *mut u8, len: usize) {
+    let p = p as usize;
+    (0..len.div_ceil(1 << 21)).into_par_iter().for_each(|i| {
+        let s = i << 21;
+        let e = (s + (1 << 21)).min(len);
+        let mut o = s;
+        while o < e {
+            unsafe { std::ptr::write_volatile((p + o) as *mut u8, 0) };
+            o += 4096;
+        }
+    });
+}
+
 fn manifest_ts(s: &str, key: &str) -> i64 {
     let i = s.find(key).expect("manifest key");
     let rest = &s[i + key.len()..];
@@ -1073,6 +1089,10 @@ fn main() {
         };
         let mut oname: Vec<u64> = vec![0; cap];
         let onp = oname.as_mut_ptr() as usize;
+        // Fault the table in parallel, one huge page per task: random inserts would otherwise pile up
+        // on the same few page faults (each zeroes 2 MB) and run nearly serially.
+        prefault(slots.as_mut_ptr() as *mut u8, cap * std::mem::size_of::<LSlot>());
+        prefault(onp as *mut u8, cap * 8);
         // Union-find state lives in each slot's person field: low half = parent (0 = root, else parent slot + 1),
         // high half = a root's best (smallest-name) slot + 1, which becomes every member's person below.
         let sp = slots.as_mut_ptr() as usize;
