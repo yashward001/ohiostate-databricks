@@ -1032,6 +1032,19 @@ fn main() {
     let lk_paths = list_csv(&data.join("links"));
     let (ev_maps, (ck_maps, lk_maps)) = rayon::join(|| open_all(&ev_paths), || rayon::join(|| open_all(&ck_paths), || open_all(&lk_paths)));
     log!("mmap");
+    // If the inputs are not in the page cache yet, start reading them all now, off the critical path.
+    if std::env::var("SS_NOWILLNEED").is_err() {
+        let regs: Vec<(usize, usize)> = ev_maps.iter().chain(ck_maps.iter()).chain(lk_maps.iter()).map(|m| (m.as_ptr() as usize, m.len())).collect();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            for (p, l) in regs {
+                unsafe { madvise(p as *mut std::ffi::c_void, l, 3 /* MADV_WILLNEED */) };
+            }
+            if std::env::var("SS_VERBOSE").is_ok() {
+                eprintln!("willneed took {:?}", t.elapsed());
+            }
+        });
+    }
 
     // ---- products / campaigns
     let prod_raw = read_small(&data.join("products.csv"));
