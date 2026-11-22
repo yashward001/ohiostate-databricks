@@ -1893,7 +1893,40 @@ fn main() {
             }
         }
     }
+    // Outputs are closed. Release the big mappings in parallel (madvise holds the mmap lock only for
+    // reading) so the exit-time teardown, which runs on one core, has little left to do.
+    if std::env::var("SS_NOREL").is_err() {
+        let mut regs: Vec<(usize, usize)> = Vec::new();
+        for m in ev_maps.iter().chain(ck_maps.iter()).chain(lk_maps.iter()) {
+            regs.push((m.as_ptr() as usize, m.len()));
+        }
+        for a in [&ke_arena, &dd_arena] {
+            if a.base != 0 {
+                regs.push((a.base, a.off.load(std::sync::atomic::Ordering::Relaxed).min(a.cap)));
+            }
+        }
+        regs.push((link_tab.slots.as_ptr() as usize, link_tab.slots.len() * std::mem::size_of::<LSlot>()));
+        regs.push((link_tab.name.as_ptr() as usize, link_tab.name.len() * 8));
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (p, l) in regs {
+            let (s0, e0) = ((p + 4095) & !4095, (p + l) & !4095);
+            let mut o = s0;
+            while o < e0 {
+                let e = (o + (16 << 20)).min(e0);
+                pieces.push((o, e - o));
+                o = e;
+            }
+        }
+        pieces.par_iter().for_each(|&(p, l)| unsafe {
+            madvise(p as *mut std::ffi::c_void, l, 4 /* MADV_DONTNEED */);
+        });
+        log!("released");
+    }
     std::process::exit(0);
+}
+
+unsafe extern "C" {
+    fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
 }
 
 #[allow(clippy::too_many_arguments)]
