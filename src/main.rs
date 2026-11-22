@@ -653,14 +653,51 @@ struct Ev {
 
 /// One contiguous buffer split into shards by offsets.
 struct Parts<T, const M: usize> {
-    v: Vec<T>,
+    ptr: *mut T,
     off: [u32; M],
 }
+unsafe impl<T, const M: usize> Send for Parts<T, M> {}
+unsafe impl<T, const M: usize> Sync for Parts<T, M> {}
 impl<T, const M: usize> std::ops::Index<usize> for Parts<T, M> {
     type Output = [T];
     #[inline(always)]
     fn index(&self, i: usize) -> &[T] {
-        unsafe { self.v.get_unchecked(self.off[i] as usize..self.off[i + 1] as usize) }
+        unsafe { std::slice::from_raw_parts(self.ptr.add(self.off[i] as usize), (self.off[i + 1] - self.off[i]) as usize) }
+    }
+}
+
+/// Bump arena over one anonymous huge-page mapping (no per-buffer rounding waste); never freed.
+struct Arena {
+    base: usize,
+    cap: usize,
+    off: std::sync::atomic::AtomicUsize,
+}
+impl Arena {
+    fn new(cap: usize) -> Arena {
+        let cap = (cap + (2 << 20) - 1) & !((2 << 20) - 1);
+        let base = match memmap2::MmapMut::map_anon(cap + (2 << 20)) {
+            Ok(m) => {
+                let _ = m.advise(memmap2::Advice::HugePage);
+                let p = m.as_ptr() as usize;
+                std::mem::forget(m);
+                (p + (2 << 20) - 1) & !((2 << 20) - 1)
+            }
+            Err(_) => 0,
+        };
+        Arena { base, cap: if base == 0 { 0 } else { cap }, off: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    fn alloc<T>(&self, n: usize) -> *mut T {
+        let bytes = (n * std::mem::size_of::<T>() + 63) & !63;
+        let o = self.off.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if o + bytes <= self.cap {
+            (self.base + o) as *mut T
+        } else {
+            let mut v = std::mem::ManuallyDrop::new(Vec::<T>::with_capacity(n));
+            v.as_mut_ptr()
+        }
+    }
+    fn reset(&self) {
+        self.off.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -819,6 +856,16 @@ unsafe fn sl<'a>(p: usize, n: u16) -> &'a [u8] {
 
 type URow = (usize, u16, i32, u32, u32, u64, u8);
 
+fn rss_anon_mb() -> u64 {
+    let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for l in st.lines() {
+        if let Some(r) = l.strip_prefix("RssAnon:") {
+            return r.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap_or(0) / 1024;
+        }
+    }
+    0
+}
+
 fn proc_cpu() -> f64 {
     let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     let rest = st.rsplit(')').next().unwrap_or("");
@@ -842,7 +889,7 @@ fn main() {
     }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     macro_rules! log {
-        ($($t:tt)*) => { if verbose { eprintln!("{:>8.1?} cpu {:>6.2}s {}", t0.elapsed(), proc_cpu(), format!($($t)*)); } };
+        ($($t:tt)*) => { if verbose { eprintln!("{:>8.1?} cpu {:>6.2}s anon {:>5}M {}", t0.elapsed(), proc_cpu(), rss_anon_mb(), format!($($t)*)); } };
     }
 
     let man = String::from_utf8(read_small(&data.join("manifest.json"))).unwrap();
@@ -1092,6 +1139,9 @@ fn main() {
     log!("links");
     let ev_chunks = chunks(&ev_maps, 8 << 20);
     let nthr = rayon::current_num_threads() + 1;
+    let ev_bytes: usize = ev_chunks.iter().map(|b| b.len()).sum();
+    let ke_arena = Arena::new(ev_bytes / 30 * std::mem::size_of::<Ke>() + (8 << 20));
+    let dd_arena = Arena::new(ev_bytes / 30 * std::mem::size_of::<Dd>() + (8 << 20));
     let st_scr: Vec<Mutex<Vec<Ev>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
     #[allow(clippy::type_complexity)]
     let parsed: Vec<(Parts<Ke, { NP + 1 }>, Parts<Dd, { NS + 1 }>)> = ev_chunks
@@ -1101,8 +1151,9 @@ fn main() {
             let mut stg = st_scr[tid].lock().unwrap();
             let stg = &mut *stg;
             stg.clear();
-            stg.reserve(buf.len() / 8 + 2);
-            let sbase = stg.as_mut_ptr();
+            stg.reserve(buf.len() / 32 + 64);
+            let mut sbase = stg.as_mut_ptr();
+            let mut scap = stg.capacity();
             let mut sn = 0usize;
             let tp0 = Instant::now();
             scan::<7>(buf, |f| {
@@ -1159,6 +1210,12 @@ fn main() {
                         }
                     }
                 }
+                if sn == scap {
+                    unsafe { stg.set_len(sn) };
+                    stg.reserve(sn);
+                    sbase = stg.as_mut_ptr();
+                    scap = stg.capacity();
+                }
                 unsafe { sbase.add(sn).write(e) };
                 sn += 1;
             });
@@ -1197,10 +1254,9 @@ fn main() {
             let koff = kc;
             let doff = dc;
             let tp2 = Instant::now();
-            let mut kp: Vec<Ke> = Vec::with_capacity(nk);
-            let mut dp: Vec<Dd> = Vec::with_capacity(nd);
+            let kq: *mut Ke = ke_arena.alloc(nk);
+            let dq: *mut Dd = dd_arena.alloc(nd);
             unsafe {
-                let (kq, dq) = (kp.as_mut_ptr(), dp.as_mut_ptr());
                 for e in stg.iter() {
                     let mut loc = u32::MAX;
                     if pl_typ(e.payload) != 3 {
@@ -1213,14 +1269,12 @@ fn main() {
                     dq.add(dc[es] as usize).write(Dd { eid: e.eid, ingest: e.ingest, loc });
                     dc[es] += 1;
                 }
-                kp.set_len(nk);
-                dp.set_len(nd);
             }
             let tp3 = Instant::now();
             PT[0].fetch_add((tp1 - tp0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             PT[1].fetch_add((tp2 - tp1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             PT[2].fetch_add((tp3 - tp2).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            (Parts { v: kp, off: koff }, Parts { v: dp, off: doff })
+            (Parts { ptr: kq, off: koff }, Parts { ptr: dq, off: doff })
         })
         .collect();
     log!("parse events: {} chunks  scan {:?} resolve {:?} write {:?}", ev_chunks.len(), std::time::Duration::from_nanos(PT[0].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[1].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[2].load(std::sync::atomic::Ordering::Relaxed)));
@@ -1232,7 +1286,7 @@ fn main() {
         kept_parts.push(k);
         dd_parts.push(d);
     }
-    let kptr: Vec<usize> = kept_parts.iter_mut().map(|c| c.v.as_mut_ptr() as usize).collect();
+    let kptr: Vec<usize> = kept_parts.iter().map(|c| c.ptr as usize).collect();
     {
         let dd_scr: Vec<Mutex<Vec<(u64, u32, u32)>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
         let kptr = &kptr;
@@ -1281,10 +1335,11 @@ fn main() {
         });
     }
     drop(dd_parts);
+    dd_arena.reset(); // reuse the already-touched dedup memory for clicks
     log!("dedup");
 
     // ---- clicks
-    let ck_chunks = chunks(&ck_maps, 4 << 20);
+    let ck_chunks = chunks(&ck_maps, 3 << 20);
     let ck_scr: Vec<Mutex<Vec<Ck>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
     let ck_parts: Vec<Parts<Ck, { NP + 1 }>> = ck_chunks
         .par_iter()
@@ -1293,8 +1348,9 @@ fn main() {
             let mut rawg = ck_scr[tid].lock().unwrap();
             let raw = &mut *rawg;
             raw.clear();
-            raw.reserve(buf.len() / 5 + 2);
-            let rbase = raw.as_mut_ptr();
+            raw.reserve(buf.len() / 24 + 64);
+            let mut rbase = raw.as_mut_ptr();
+            let mut rcap = raw.capacity();
             let mut rn = 0usize;
             let tc0 = Instant::now();
             scan::<4>(buf, |f| {
@@ -1307,6 +1363,12 @@ fn main() {
                     return;
                 }
                 let Some(&ci) = camp_map.get(&hb(camp)) else { return };
+                if rn == rcap {
+                    unsafe { raw.set_len(rn) };
+                    raw.reserve(rn);
+                    rbase = raw.as_mut_ptr();
+                    rcap = raw.capacity();
+                }
                 unsafe { rbase.add(rn).write(Ck { person: hb(user), ts: (t - cws) as u32, camp: ci, clen: cid.len() as u16, cid: cid.as_ptr() as usize }) };
                 rn += 1;
             });
@@ -1330,17 +1392,15 @@ fn main() {
             }
             let off = kc;
             let n = kc[NP] as usize;
-            let mut v: Vec<Ck> = Vec::with_capacity(n);
+            let q: *mut Ck = dd_arena.alloc(n);
             unsafe {
-                let q = v.as_mut_ptr();
                 for c in raw.iter() {
                     let ps = pshard(c.person);
                     q.add(kc[ps] as usize).write(*c);
                     kc[ps] += 1;
                 }
-                v.set_len(n);
             }
-            Parts { v, off }
+            Parts { ptr: q, off }
         })
         .collect();
     log!("clicks: scan {:?}", std::time::Duration::from_nanos(PT[3].load(std::sync::atomic::Ordering::Relaxed)));
@@ -1356,7 +1416,8 @@ fn main() {
         x.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     let ss_scr: Vec<Mutex<(Vec<u32>, Vec<Ke>, Vec<Ck>)>> = (0..nthreads + 1).map(|_| Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
-    let user_rows: Vec<Vec<URow>> = (0..NP)
+    let rows_scr: Vec<Mutex<Vec<URow>>> = (0..nthreads + 1).map(|_| Mutex::new(Vec::new())).collect();
+    let user_rows: Vec<&[URow]> = (0..NP)
         .into_par_iter()
         .map(|p| {
             let tid = rayon::current_thread_index().unwrap_or(nthreads);
@@ -1440,7 +1501,9 @@ fn main() {
                 accg.resize((ncamp + 1) * ndays, [0; 4]);
             }
             let acc = &mut *accg;
-            let mut rows: Vec<URow> = Vec::with_capacity(n / 12 + 16);
+            let mut rowsg = rows_scr[tid].lock().unwrap();
+            let rows = &mut *rowsg;
+            rows.clear();
             let mut catsum = vec![0u64; ncat];
             let mut touched: Vec<u8> = Vec::with_capacity(ncat);
             let mut ccount = vec![0u32; ncamp];
@@ -1577,7 +1640,11 @@ fn main() {
                 present.clear();
                 i = j;
             }
-            rows
+            let q: *mut URow = dd_arena.alloc(rows.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(rows.as_ptr(), q, rows.len());
+                std::slice::from_raw_parts(q as *const URow, rows.len())
+            }
         })
         .collect();
     log!("sessions: gather {:?} sort {:?} clicks {:?}", std::time::Duration::from_nanos(PT[0].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[1].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[2].load(std::sync::atomic::Ordering::Relaxed)));
@@ -1593,11 +1660,19 @@ fn main() {
     }
     write_outputs(&out, &user_rows, &cat_names, &camp, &camp_ids, &camp_chan, ndays, ws_day);
     log!("done");
+    if verbose {
+        let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for l in st.lines() {
+            if l.starts_with("VmHWM") || l.starts_with("RssAnon") || l.starts_with("RssFile") {
+                eprintln!("{}", l);
+            }
+        }
+    }
     std::process::exit(0);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_outputs(out: &Path, user_rows: &[Vec<URow>], cat_names: &[Vec<u8>], camp: &[[u64; 4]], camp_ids: &[Vec<u8>], camp_chan: &[Vec<u8>], ndays: usize, ws_day: i64) {
+fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp: &[[u64; 4]], camp_ids: &[Vec<u8>], camp_chan: &[Vec<u8>], ndays: usize, ws_day: i64) {
     use arrow_array::builder::{Date32Builder, Int64Builder, StringBuilder};
     use arrow_array::{ArrayRef, RecordBatch};
     use parquet::arrow::ArrowWriter;
@@ -1618,7 +1693,7 @@ fn write_outputs(out: &Path, user_rows: &[Vec<URow>], cat_names: &[Vec<u8>], cam
 
     let ng = 16usize.min(user_rows.len().max(1));
     let per = user_rows.len().div_ceil(ng).max(1);
-    let groups: Vec<&[Vec<URow>]> = user_rows.chunks(per).collect();
+    let groups: Vec<&[&[URow]]> = user_rows.chunks(per).collect();
     let cat_strs: Vec<&str> = cat_names.iter().map(|c| unsafe { std::str::from_utf8_unchecked(c) }).collect();
     let camp_job = || {
         let mut cid = StringBuilder::new();
