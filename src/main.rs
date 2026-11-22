@@ -1800,14 +1800,23 @@ fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp:
             if n == 0 && gi != 0 {
                 return;
             }
-            let mut uid = StringBuilder::with_capacity(n, n * 16);
-            let mut day = Date32Builder::with_capacity(n);
-            let mut ses = Int32Builder::with_capacity(n);
-            let mut evs = Int32Builder::with_capacity(n);
-            let mut rev = Int64Builder::with_capacity(n);
-            let mut top = StringBuilder::with_capacity(n, n * 8);
-            for p in g.iter() {
-                for r in p.iter() {
+            // Small row groups, written as they fill: the builders and the writer's page
+            // buffers stay a few MB instead of holding the whole file in fresh memory.
+            const RG: usize = 1 << 16;
+            let f = fs::File::create(ud.join(format!("part-{gi}.parquet"))).unwrap();
+            let mut w: Option<ArrowWriter<fs::File>> = None;
+            let mut left = n;
+            let mut it = g.iter().flat_map(|p| p.iter());
+            let mut f = Some(f);
+            loop {
+                let m = left.min(RG);
+                let mut uid = StringBuilder::with_capacity(m, m * 16);
+                let mut day = Date32Builder::with_capacity(m);
+                let mut ses = Int32Builder::with_capacity(m);
+                let mut evs = Int32Builder::with_capacity(m);
+                let mut rev = Int64Builder::with_capacity(m);
+                let mut top = StringBuilder::with_capacity(m, m * 8);
+                for r in it.by_ref().take(m) {
                     uid.append_value(unsafe { std::str::from_utf8_unchecked(sl(r.0, r.1)) });
                     day.append_value(r.2);
                     ses.append_value(r.3 as i32);
@@ -1819,20 +1828,33 @@ fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp:
                         top.append_value(cat_strs[r.6 as usize]);
                     }
                 }
+                left -= m;
+                let cols: Vec<(&str, ArrayRef)> = vec![
+                    ("user_id", Arc::new(uid.finish())),
+                    ("day", Arc::new(day.finish())),
+                    ("sessions", Arc::new(ses.finish())),
+                    ("events", Arc::new(evs.finish())),
+                    ("revenue_cents", Arc::new(rev.finish())),
+                    ("top_category", Arc::new(top.finish())),
+                ];
+                let batch = RecordBatch::try_from_iter(cols).unwrap();
+                if w.is_none() {
+                    let pr = WriterProperties::builder()
+                        .set_compression(Compression::UNCOMPRESSED)
+                        .set_dictionary_enabled(false)
+                        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+                        .set_max_row_group_size(RG)
+                        .build();
+                    w = Some(ArrowWriter::try_new(f.take().unwrap(), batch.schema(), Some(pr)).unwrap());
+                }
+                let wr = w.as_mut().unwrap();
+                wr.write(&batch).unwrap();
+                wr.flush().unwrap();
+                if left == 0 {
+                    break;
+                }
             }
-            let cols: Vec<(&str, ArrayRef)> = vec![
-                ("user_id", Arc::new(uid.finish())),
-                ("day", Arc::new(day.finish())),
-                ("sessions", Arc::new(ses.finish())),
-                ("events", Arc::new(evs.finish())),
-                ("revenue_cents", Arc::new(rev.finish())),
-                ("top_category", Arc::new(top.finish())),
-            ];
-            let batch = RecordBatch::try_from_iter(cols).unwrap();
-            let f = fs::File::create(ud.join(format!("part-{gi}.parquet"))).unwrap();
-            let mut w = ArrowWriter::try_new(f, batch.schema(), Some(props())).unwrap();
-            w.write(&batch).unwrap();
-            w.close().unwrap();
+            w.unwrap().close().unwrap();
         });
     });
 }
