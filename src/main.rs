@@ -1552,6 +1552,9 @@ fn main() {
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
                 }
+                if j + 24 < ev.len() {
+                    link_tab.prefetch(ev[j + 24].person);
+                }
                 let (name, nlen) = match link_tab.find(person) {
                     Some(h) => {
                         let r = link_tab.slots[h].rname;
@@ -1729,7 +1732,7 @@ fn main() {
 
 #[allow(clippy::too_many_arguments)]
 fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp: &[[u64; 4]], camp_ids: &[Vec<u8>], camp_chan: &[Vec<u8>], ndays: usize, ws_day: i64) {
-    use arrow_array::builder::{Date32Builder, Int64Builder, StringBuilder};
+    use arrow_array::builder::{Date32Builder, Int32Builder, Int64Builder, StringBuilder};
     use arrow_array::{ArrayRef, RecordBatch};
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
@@ -1799,16 +1802,16 @@ fn write_outputs(out: &Path, user_rows: &[&[URow]], cat_names: &[Vec<u8>], camp:
             }
             let mut uid = StringBuilder::with_capacity(n, n * 16);
             let mut day = Date32Builder::with_capacity(n);
-            let mut ses = Int64Builder::with_capacity(n);
-            let mut evs = Int64Builder::with_capacity(n);
+            let mut ses = Int32Builder::with_capacity(n);
+            let mut evs = Int32Builder::with_capacity(n);
             let mut rev = Int64Builder::with_capacity(n);
             let mut top = StringBuilder::with_capacity(n, n * 8);
             for p in g.iter() {
                 for r in p.iter() {
                     uid.append_value(unsafe { std::str::from_utf8_unchecked(sl(r.0, r.1)) });
                     day.append_value(r.2);
-                    ses.append_value(r.3 as i64);
-                    evs.append_value(r.4 as i64);
+                    ses.append_value(r.3 as i32);
+                    evs.append_value(r.4 as i32);
                     rev.append_value(r.5 as i64);
                     if r.6 == u8::MAX {
                         top.append_null();
