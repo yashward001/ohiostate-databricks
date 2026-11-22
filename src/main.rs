@@ -812,8 +812,8 @@ struct LSlot {
 /// A person is numbered by one slot (pidx): its smallest ID's slot, so the slot's name is the person's name.
 struct LinkTable {
     cap: usize,
-    slots: Vec<LSlot>, // key 0 = empty
-    name: Vec<u64>,    // per slot: the ID, ptr << 16 | len
+    slots: &'static mut [LSlot], // key 0 = empty
+    name: &'static mut [u64],    // per slot: the ID, ptr << 16 | len
     sp: usize,         // slots.as_mut_ptr(), for concurrent inserts
     np: usize,         // name.as_mut_ptr()
     used: std::sync::atomic::AtomicUsize,
@@ -911,6 +911,15 @@ impl LinkTable {
     }
 }
 unsafe impl Sync for LinkTable {}
+
+/// A zeroed, never-freed buffer in its own anonymous mapping (normal pages).
+fn anon_slice<T>(n: usize) -> &'static mut [T] {
+    let bytes = (n * std::mem::size_of::<T>()).max(1);
+    let m = memmap2::MmapMut::map_anon(bytes).expect("map_anon");
+    let p = m.as_ptr() as *mut T;
+    std::mem::forget(m);
+    unsafe { std::slice::from_raw_parts_mut(p, n) }
+}
 
 /// Touch every page of a fresh zeroed buffer, 2 MB per parallel task.
 fn prefault(p: *mut u8, len: usize) {
@@ -1096,12 +1105,9 @@ fn main() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
         // > the most distinct IDs n lines can hold, plus room for IDs that appear only in events
         let cap = n * 2 + 64 + extra;
-        let mut slots: Vec<LSlot> = unsafe {
-            let layout = std::alloc::Layout::array::<LSlot>(cap).unwrap();
-            let p = std::alloc::alloc_zeroed(layout) as *mut LSlot;
-            Vec::from_raw_parts(p, cap, cap)
-        };
-        let mut oname: Vec<u64> = vec![0; cap];
+        // Own 4 KB-page mappings (huge pages are slow to fault in when the VM is cold).
+        let slots: &'static mut [LSlot] = anon_slice(cap);
+        let oname: &'static mut [u64] = anon_slice(cap);
         let onp = oname.as_mut_ptr() as usize;
         // Fault the table in parallel, one huge page per task: random inserts would otherwise pile up
         // on the same few page faults (each zeroes 2 MB) and run nearly serially.
