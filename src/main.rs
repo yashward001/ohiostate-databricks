@@ -27,6 +27,7 @@ fn hb(b: &[u8]) -> u64 {
     H.hash_one(b) | 1
 }
 
+static PT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 const NS: usize = 256; // event-id shards
 const NP: usize = 256; // person shards
 #[inline]
@@ -250,6 +251,253 @@ unsafe fn block_mask_avx2(p: *const u8) -> u64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c1 = _mm256_set1_epi8(b',' as i8);
+        let c2 = _mm256_set1_epi8(b'"' as i8);
+        let c3 = _mm256_set1_epi8(b'\n' as i8);
+        let mut cm = 0u128;
+        let mut qm = 0u128;
+        let mut nm = 0u128;
+        for i in 0..4 {
+            let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
+            cm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c1)) as u32 as u128) << (32 * i);
+            qm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c2)) as u32 as u128) << (32 * i);
+            nm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c3)) as u32 as u128) << (32 * i);
+        }
+        (cm, qm, nm)
+    }
+}
+
+/// Scratch for `scan_idx`.
+#[derive(Default)]
+struct ScanScr {
+    sp: Vec<u32>,
+    qm: Vec<u64>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let c1 = _mm256_set1_epi8(b',' as i8);
+        let c2 = _mm256_set1_epi8(b'"' as i8);
+        let c3 = _mm256_set1_epi8(b'\n' as i8);
+        let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
+        (m(a, c1) | (m(b, c1) << 32), m(a, c2) | (m(b, c2) << 32), m(a, c3) | (m(b, c3) << 32))
+    }
+}
+
+#[inline(always)]
+fn qcount(qm: &[u64], s: usize, e: usize) -> u32 {
+    // quotes in [s, e)
+    if e <= s {
+        return 0;
+    }
+    let (b0, b1) = (s >> 6, (e - 1) >> 6);
+    let mut c = 0u32;
+    for b in b0..=b1 {
+        let mut m = unsafe { *qm.get_unchecked(b) };
+        if b == b0 {
+            m &= !0u64 << (s & 63);
+        }
+        if b == b1 {
+            let hi = ((e - 1) & 63) as u32;
+            m &= u64::MAX >> (63 - hi);
+        }
+        c += m.count_ones();
+    }
+    c
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(never)]
+fn stage1(buf: &[u8], scr: &mut ScanScr) -> usize {
+    const NL: u32 = 1 << 31;
+    let len = buf.len();
+    let nb = len.div_ceil(64);
+    scr.sp.clear();
+    scr.sp.reserve(len + 80);
+    scr.qm.clear();
+    scr.qm.reserve(nb + 1);
+    let base = buf.as_ptr();
+    let mut cnt = 0usize;
+    unsafe {
+        let sp = scr.sp.as_mut_ptr();
+        let qm = scr.qm.as_mut_ptr();
+        for b in 0..nb {
+            let o = b * 64;
+            let (c, q, n) = if o + 64 <= len {
+                masks64(base.add(o))
+            } else {
+                let mut tmp = [0u8; 64];
+                std::ptr::copy_nonoverlapping(base.add(o), tmp.as_mut_ptr(), len - o);
+                masks64(tmp.as_ptr())
+            };
+            *qm.add(b) = q;
+            let mut sep = c | n;
+            let k = sep.count_ones() as usize;
+            let mut w = sp.add(cnt);
+            while sep != 0 {
+                for _ in 0..8 {
+                    let tz = sep.trailing_zeros();
+                    *w = (o as u32 + tz) | (((n.wrapping_shr(tz)) as u32 & 1) << 31);
+                    w = w.add(1);
+                    sep &= sep.wrapping_sub(1);
+                }
+            }
+            cnt += k;
+        }
+        if *base.add(len - 1) != b'\n' {
+            *sp.add(cnt) = len as u32 | NL;
+            cnt += 1;
+        }
+        // padding so 8-lane loads past the end read defined memory
+        for i in 0..8 {
+            *sp.add(cnt + i) = 0;
+        }
+        scr.sp.set_len(cnt + 8);
+        scr.qm.set_len(nb);
+    }
+    cnt
+}
+
+/// Same contract as `scan`: two-stage (structural index, then per line) scanner.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn scan_idx<'a, const N: usize>(buf: &'a [u8], scr: &mut ScanScr, mut f: impl FnMut(&[&'a [u8]; N])) {
+    use std::arch::x86_64::*;
+    const NL: u32 = 1 << 31;
+    let len = buf.len();
+    if len == 0 {
+        return;
+    }
+    let cnt = stage1(buf, scr);
+    let sp = &scr.sp[..];
+    let qm = &scr.qm[..];
+    let want: i32 = 1 << (N - 1);
+    let lane: i32 = (1 << N) - 1;
+    let mut j = 0usize;
+    let mut start = 0usize;
+    while j < cnt {
+        let bits = unsafe { _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_loadu_si256(sp.as_ptr().add(j) as *const __m256i))) } & lane;
+        if bits == want && j + N <= cnt {
+            let mut fs: [(usize, usize); N] = [(0, 0); N];
+            let mut a = start;
+            for k in 0..N {
+                let e = (sp[j + k] & !NL) as usize;
+                fs[k] = (a, e);
+                a = e + 1;
+            }
+            let end = fs[N - 1].1;
+            let tq = qcount(qm, start, end);
+            let mut ok = true;
+            if tq != 0 {
+                let mut qb = 0u32;
+                for k in 0..N {
+                    let (a, e) = fs[k];
+                    let sq = a < e && buf[a] == b'"';
+                    let eq = e > a + 1 && buf[e - 1] == b'"';
+                    qb += sq as u32 + eq as u32;
+                    if sq != eq {
+                        ok = false;
+                    } else if sq {
+                        fs[k] = (a + 1, e - 1);
+                    }
+                }
+                if qb != tq {
+                    ok = false;
+                }
+            }
+            if ok {
+                let arr: [&'a [u8]; N] = std::array::from_fn(|k| unsafe { buf.get_unchecked(fs[k].0..fs[k].1) });
+                f(&arr);
+            }
+            j += N;
+            start = end + 1;
+        } else {
+            // wrong field count: skip to the end of this line
+            let mut k = j;
+            while sp[k] & NL == 0 {
+                k += 1;
+            }
+            start = (sp[k] & !NL) as usize + 1;
+            j = k + 1;
+        }
+    }
+}
+
+/// Same contract as `scan`, with a per-line SIMD fast path (lines < 128 bytes).
+#[inline(always)]
+fn scan_fast<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let len = buf.len();
+        let base = buf.as_ptr();
+        let mut s = 0usize;
+        let mut fs: [(u32, u32); N] = [(0, 0); N];
+        while s + 128 <= len {
+            let (cm, qm, nm) = unsafe { masks128(base.add(s)) };
+            if nm == 0 {
+                // long line: hand it to the generic scanner
+                let e = match memchr::memchr(b'\n', &buf[s..]) {
+                    Some(p) => s + p + 1,
+                    None => len,
+                };
+                scan::<N>(&buf[s..e], &mut f);
+                s = e;
+                continue;
+            }
+            let e = nm.trailing_zeros();
+            let lm = (1u128 << e) - 1;
+            let mut cms = cm & lm;
+            if cms.count_ones() as usize == N - 1 {
+                let mut a = 0u32;
+                for k in 0..N - 1 {
+                    let c = cms.trailing_zeros();
+                    fs[k] = (a, c);
+                    a = c + 1;
+                    cms &= cms - 1;
+                }
+                fs[N - 1] = (a, e);
+                let qms = qm & lm;
+                let mut ok = true;
+                if qms != 0 {
+                    for k in 0..N {
+                        let (a, b) = fs[k];
+                        let rm = ((1u128 << b) - 1) & !((1u128 << a) - 1);
+                        let fq = qms & rm;
+                        if fq != 0 {
+                            if b >= a + 2 && fq == ((1u128 << a) | (1u128 << (b - 1))) {
+                                fs[k] = (a + 1, b - 1);
+                            } else {
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+                if ok {
+                    let arr: [&'a [u8]; N] = std::array::from_fn(|k| unsafe { std::slice::from_raw_parts(base.add(s + fs[k].0 as usize), (fs[k].1 - fs[k].0) as usize) });
+                    f(&arr);
+                }
+            }
+            s += e as usize + 1;
+        }
+        if s < len {
+            scan::<N>(&buf[s..], &mut f);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    scan::<N>(buf, f)
+}
+
 /// Scan CSV lines with exactly N fields under the rules' dialect; calls f with unquoted fields.
 #[inline(always)]
 fn scan<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
@@ -403,6 +651,28 @@ struct Ev {
     nlen: u16,
 }
 
+/// One contiguous buffer split into shards by offsets.
+struct Parts<T, const M: usize> {
+    v: Vec<T>,
+    off: [u32; M],
+}
+impl<T, const M: usize> std::ops::Index<usize> for Parts<T, M> {
+    type Output = [T];
+    #[inline(always)]
+    fn index(&self, i: usize) -> &[T] {
+        unsafe { self.v.get_unchecked(self.off[i] as usize..self.off[i + 1] as usize) }
+    }
+}
+
+/// Dedup key: eid hash, ingest, location of the kept candidate (pshard<<24|idx, MAX = invalid).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Dd {
+    eid: u64,
+    ingest: i32,
+    loc: u32,
+}
+
 /// Kept event for sessionization.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -473,6 +743,16 @@ impl LinkTable {
         }
     }
     #[inline(always)]
+    fn prefetch2(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let h = self.slot(k);
+            _mm_prefetch(self.slots.as_ptr().add(h) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.names.as_ptr().add(h) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
     fn person(&self, k: u64) -> u64 {
         match self.find(k) {
             Some(h) => self.slots[h].1,
@@ -531,6 +811,15 @@ unsafe fn sl<'a>(p: usize, n: u16) -> &'a [u8] {
 
 type URow = (usize, u16, i32, u32, u32, u64, u8);
 
+fn proc_cpu() -> f64 {
+    let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = st.rsplit(')').next().unwrap_or("");
+    let v: Vec<&str> = rest.split_whitespace().collect();
+    let ut: f64 = v.get(11).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    let stt: f64 = v.get(12).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    (ut + stt) / 100.0
+}
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -545,7 +834,7 @@ fn main() {
     }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     macro_rules! log {
-        ($($t:tt)*) => { if verbose { eprintln!("{:>8.1?} {}", t0.elapsed(), format!($($t)*)); } };
+        ($($t:tt)*) => { if verbose { eprintln!("{:>8.1?} cpu {:>6.2}s {}", t0.elapsed(), proc_cpu(), format!($($t)*)); } };
     }
 
     let man = String::from_utf8(read_small(&data.join("manifest.json"))).unwrap();
@@ -616,75 +905,197 @@ fn main() {
     lk_chunks
         .par_iter()
         .map(|buf| {
-            let mut v = Vec::with_capacity(buf.len() / 20);
+            let mut v: Vec<(u64, u64, usize, u16, usize, u16)> = Vec::with_capacity(buf.len() / 4 + 2);
+            let vb = v.as_mut_ptr();
+            let mut vn = 0usize;
             scan::<2>(buf, |f| {
                 let (a, b) = (f[0], f[1]);
                 if !a.is_empty() && !b.is_empty() {
-                    v.push((hb(a), hb(b), a.as_ptr() as usize, a.len() as u16, b.as_ptr() as usize, b.len() as u16));
+                    unsafe { vb.add(vn).write((hb(a), hb(b), a.as_ptr() as usize, a.len() as u16, b.as_ptr() as usize, b.len() as u16)) };
+                    vn += 1;
                 }
             });
+            unsafe { v.set_len(vn) };
             v
         })
         .collect()
     };
     let links_job = || -> LinkTable {
         let lk_pairs = lk_parse();
+        log!("  lk parse");
         let n: usize = lk_pairs.iter().map(|v| v.len()).sum();
-        let mut idx: HashMap<u64, u32, BuildNoHash> = HashMap::with_capacity_and_hasher(n, BuildNoHash);
-        let mut names: Vec<(usize, u16)> = Vec::with_capacity(n);
-        let mut hashes: Vec<u64> = Vec::with_capacity(n);
-        let mut edges: Vec<(u32, u32)> = Vec::with_capacity(n);
-        for v in &lk_pairs {
-            for &(ha, hbb, pa, la, pb, lb) in v {
-                let ia = *idx.entry(ha).or_insert_with(|| {
-                    names.push((pa, la));
-                    hashes.push(ha);
-                    (names.len() - 1) as u32
-                });
-                let ib = *idx.entry(hbb).or_insert_with(|| {
-                    names.push((pb, lb));
-                    hashes.push(hbb);
-                    (names.len() - 1) as u32
-                });
-                edges.push((ia, ib));
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+        let cap = (n * 4).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut slots: Vec<(u64, u64)> = vec![(0, 0); cap];
+        let mut names: Vec<(usize, u16)> = vec![(0, 0); cap];
+        let par: Vec<AtomicU32> = (0..0).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        drop(par);
+        let parent: Vec<u32> = vec![0; cap]; // 0 = root, else parent slot + 1
+        let best: Vec<u32> = vec![0; cap]; // 0 = none, else best slot + 1
+        let sp = slots.as_mut_ptr() as usize;
+        let np = names.as_mut_ptr() as usize;
+        let pp = parent.as_ptr() as usize;
+        let bp = best.as_ptr() as usize;
+        let key_at = |h: usize| unsafe { AtomicU64::from_ptr((sp as *mut (u64, u64)).add(h) as *mut u64) };
+        let par_at = |h: usize| unsafe { AtomicU32::from_ptr((pp as *mut u32).add(h)) };
+        let best_at = |h: usize| unsafe { AtomicU32::from_ptr((bp as *mut u32).add(h)) };
+        let insert = |k: u64, ptr: usize, len: u16| -> u32 {
+            let mut h = (k as usize) & mask;
+            loop {
+                let a = key_at(h);
+                let cur = a.load(Relaxed);
+                if cur == k {
+                    return h as u32;
+                }
+                if cur == 0 {
+                    match a.compare_exchange(0, k, Relaxed, Relaxed) {
+                        Ok(_) => {
+                            unsafe { *(np as *mut (usize, u16)).add(h) = (ptr, len) };
+                            return h as u32;
+                        }
+                        Err(x) if x == k => return h as u32,
+                        Err(_) => {}
+                    }
+                }
+                h = (h + 1) & mask;
             }
-        }
-        let nu = names.len();
-        let mut parent: Vec<u32> = (0..nu as u32).collect();
-        let nm = |i: u32| unsafe { sl(names[i as usize].0, names[i as usize].1) };
-        for &(a, b) in &edges {
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                if nm(ra) < nm(rb) {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
+        };
+        let edges: Vec<Vec<(u32, u32)>> = lk_pairs
+            .par_iter()
+            .map(|v| v.iter().map(|&(ha, hbb, pa, la, pb, lb)| (insert(ha, pa, la), insert(hbb, pb, lb))).collect())
+            .collect();
+        log!("  lk intern");
+        let find = |mut x: u32| -> u32 {
+            loop {
+                let p = par_at(x as usize).load(Relaxed);
+                if p == 0 {
+                    return x;
+                }
+                x = p - 1;
+            }
+        };
+        edges.par_iter().for_each(|v| {
+            for &(a, b) in v {
+                loop {
+                    let (mut ra, mut rb) = (find(a), find(b));
+                    if ra == rb {
+                        break;
+                    }
+                    if ra < rb {
+                        std::mem::swap(&mut ra, &mut rb);
+                    }
+                    // link root ra under rb (smaller index)
+                    if par_at(ra as usize).compare_exchange(0, rb + 1, Relaxed, Relaxed).is_ok() {
+                        break;
+                    }
                 }
             }
-        }
-        let cap = (nu * 2).next_power_of_two().max(16);
-        let mut t = LinkTable { mask: cap - 1, slots: vec![(0, 0); cap], names: vec![(0, 0); cap] };
-        for u in 0..nu as u32 {
-            let r = find(&mut parent, u);
-            let k = hashes[u as usize];
-            let mut h = t.slot(k);
-            while t.slots[h].0 != 0 {
-                h = (h + 1) & t.mask;
+        });
+        log!("  lk uf");
+        let nm = |i: u32| unsafe {
+            let (p, l) = *(np as *const (usize, u16)).add(i as usize);
+            sl(p, l)
+        };
+        let relax_best = |u: u32| {
+            let r = find(u);
+            let a = best_at(r as usize);
+            let mut b = a.load(Relaxed);
+            loop {
+                if b != 0 && (b - 1 == u || nm(b - 1) <= nm(u)) {
+                    return;
+                }
+                match a.compare_exchange(b, u + 1, Relaxed, Relaxed) {
+                    Ok(_) => return,
+                    Err(x) => b = x,
+                }
             }
-            t.slots[h] = (k, hashes[r as usize]);
-            t.names[h] = names[u as usize];
-        }
-        t
+        };
+        edges.par_iter().for_each(|v| {
+            for &(a, b) in v {
+                relax_best(a);
+                relax_best(b);
+            }
+        });
+        let set_person = |u: u32| {
+            let r = find(u);
+            let bs = best_at(r as usize).load(Relaxed) - 1;
+            unsafe {
+                let base = sp as *mut (u64, u64);
+                let pk = (*base.add(bs as usize)).0;
+                (*base.add(u as usize)).1 = pk;
+                let nb = np as *mut (usize, u16);
+                *nb.add(u as usize) = *nb.add(bs as usize);
+            }
+        };
+        edges.par_iter().for_each(|v| {
+            for &(a, b) in v {
+                set_person(a);
+                set_person(b);
+            }
+        });
+        drop(parent);
+        drop(best);
+        LinkTable { mask, slots, names }
     };
     log!("links done");
 
-    // ---- events: parse
+    // ---- events: parse, resolve person, write kept-candidates by person shard and dedup keys by eid shard
     let ev_chunks = chunks(&ev_maps, 8 << 20);
-    let ev_job = || -> Vec<Vec<Vec<Ev>>> { ev_chunks
+    if let Ok(k) = std::env::var("SS_PB") {
+        let k: u32 = k.parse().unwrap();
+        let t = Instant::now();
+        let mut acc = 0u64;
+        let mut cnt = 0u64;
+        let copies: Vec<Vec<u8>> = ev_chunks.iter().take(2).map(|b| b.to_vec()).collect();
+        let use_copy = std::env::var("SS_PBC").is_ok();
+        let mut pscr = ScanScr::default();
+        let t = Instant::now();
+        for (bi, mbuf) in ev_chunks.iter().take(2).cycle().take(40).enumerate() {
+            let buf: &[u8] = if use_copy { &copies[bi % 2] } else { mbuf };
+            if k == 0 {
+                let mut o = 0;
+                while o + 64 <= buf.len() {
+                    acc += block_mask(buf, o).count_ones() as u64;
+                    o += 64;
+                }
+                continue;
+            }
+            let cb = |f: &[&[u8]; 7]| {
+                cnt += 1;
+                if k % 10 >= 2 {
+                    acc = acc.wrapping_add(parse_ts(f[3]).unwrap_or(0) as u64);
+                    acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64);
+                }
+                if k % 10 >= 3 {
+                    acc ^= hb(f[0]) ^ hb(f[1]);
+                }
+                acc ^= (f[4].len() + f[5].len() + f[6].len()) as u64;
+            };
+            if k >= 30 { acc += stage1(buf, &mut pscr) as u64; continue; }
+            if k >= 20 { scan_idx::<7>(buf, &mut pscr, cb) } else if k >= 10 { scan_fast::<7>(buf, cb) } else { scan::<7>(buf, cb) }
+        }
+        let bytes: usize = ev_chunks.iter().take(2).cycle().take(40).map(|b| b.len()).sum();
+        eprintln!("k={} lines={} {:?} {:.1} ns/line {:.2} GB/s ({})", k, cnt, t.elapsed(), t.elapsed().as_nanos() as f64 / cnt.max(1) as f64, bytes as f64 / t.elapsed().as_secs_f64() / 1e9, acc);
+        std::process::exit(0);
+    }
+    let link_tab = links_job();
+    log!("links");
+    let ev_chunks = chunks(&ev_maps, 8 << 20);
+    let nthr = rayon::current_num_threads() + 1;
+    let st_scr: Vec<Mutex<Vec<Ev>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
+    #[allow(clippy::type_complexity)]
+    let parsed: Vec<(Parts<Ke, { NP + 1 }>, Parts<Dd, { NS + 1 }>)> = ev_chunks
         .par_iter()
         .map(|buf| {
-            let mut parts: Vec<Vec<Ev>> = new_parts(NS, buf.len() / 85 / NS + 16);
+            let tid = rayon::current_thread_index().unwrap_or(nthr - 1);
+            let mut stg = st_scr[tid].lock().unwrap();
+            let stg = &mut *stg;
+            stg.clear();
+            stg.reserve(buf.len() / 8 + 2);
+            let sbase = stg.as_mut_ptr();
+            let mut sn = 0usize;
+            let tp0 = Instant::now();
             scan::<7>(buf, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
@@ -695,10 +1106,25 @@ fn main() {
                 let eh = hb(eid);
                 let mut e = Ev { eid: eh, person: 0, payload: 3 << 31, name: 0, ingest, nlen: 0 };
                 let user = f[1];
-                let typ = match f[4] {
-                    b"view" => 0u64,
-                    b"cart" => 1,
-                    b"purchase" => 2,
+                let tf = f[4];
+                let typ = match tf.len() {
+                    4 => {
+                        let w = u32::from_le_bytes([tf[0], tf[1], tf[2], tf[3]]);
+                        if w == u32::from_le_bytes(*b"view") {
+                            0u64
+                        } else if w == u32::from_le_bytes(*b"cart") {
+                            1
+                        } else {
+                            9
+                        }
+                    }
+                    8 => {
+                        if u64::from_le_bytes(tf.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+                            2
+                        } else {
+                            9
+                        }
+                    }
                     _ => 9,
                 };
                 if typ != 9 && !user.is_empty() && !f[5].is_empty() {
@@ -724,37 +1150,118 @@ fn main() {
                         }
                     }
                 }
-                parts[eshard(eh)].push(e);
+                unsafe { sbase.add(sn).write(e) };
+                sn += 1;
             });
-            parts
+            unsafe { stg.set_len(sn) };
+            let n = stg.len();
+            let tp1 = Instant::now();
+            const PF: usize = 16;
+            for i in 0..n.min(PF) {
+                link_tab.prefetch2(stg[i].person);
+            }
+            let mut kc = [0u32; NP + 1];
+            let mut dc = [0u32; NS + 1];
+            for i in 0..n {
+                if i + PF < n {
+                    link_tab.prefetch2(stg[i + PF].person);
+                }
+                let e = &mut stg[i];
+                if pl_typ(e.payload) != 3 {
+                    if let Some(h) = link_tab.find(e.person) {
+                        e.person = link_tab.slots[h].1;
+                        let (np_, nl_) = link_tab.names[h];
+                        e.name = np_;
+                        e.nlen = nl_;
+                    }
+                    kc[pshard(e.person) + 1] += 1;
+                }
+                dc[eshard(e.eid) + 1] += 1;
+            }
+            for i in 0..NP {
+                kc[i + 1] += kc[i];
+            }
+            for i in 0..NS {
+                dc[i + 1] += dc[i];
+            }
+            let (nk, nd) = (kc[NP] as usize, dc[NS] as usize);
+            let koff = kc;
+            let doff = dc;
+            let tp2 = Instant::now();
+            let mut kp: Vec<Ke> = Vec::with_capacity(nk);
+            let mut dp: Vec<Dd> = Vec::with_capacity(nd);
+            unsafe {
+                let (kq, dq) = (kp.as_mut_ptr(), dp.as_mut_ptr());
+                for e in stg.iter() {
+                    let mut loc = u32::MAX;
+                    if pl_typ(e.payload) != 3 {
+                        let ps = pshard(e.person);
+                        loc = kc[ps];
+                        kc[ps] += 1;
+                        kq.add(loc as usize).write(Ke { person: e.person, payload: e.payload, name: ((e.name as u64) << 16) | e.nlen as u64 });
+                    }
+                    let es = eshard(e.eid);
+                    dq.add(dc[es] as usize).write(Dd { eid: e.eid, ingest: e.ingest, loc });
+                    dc[es] += 1;
+                }
+                kp.set_len(nk);
+                dp.set_len(nd);
+            }
+            let tp3 = Instant::now();
+            PT[0].fetch_add((tp1 - tp0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            PT[1].fetch_add((tp2 - tp1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            PT[2].fetch_add((tp3 - tp2).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            (Parts { v: kp, off: koff }, Parts { v: dp, off: doff })
         })
-        .collect() };
-    let (link_tab, ev_parts) = rayon::join(links_job, ev_job);
-    log!("links + parse events: {} chunks", ev_chunks.len());
+        .collect();
+    log!("parse events: {} chunks  scan {:?} resolve {:?} write {:?}", ev_chunks.len(), std::time::Duration::from_nanos(PT[0].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[1].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[2].load(std::sync::atomic::Ordering::Relaxed)));
 
-    // ---- dedup per event shard, emit kept events partitioned by person
-    let kept_parts: Vec<Vec<Vec<Ke>>> = (0..NS)
-        .into_par_iter()
-        .map(|s| {
-            let n: usize = ev_parts.iter().map(|c| c[s].len()).sum();
+    // ---- dedup per event shard: mark losing copies dead (typ 3) in place
+    let mut kept_parts: Vec<Parts<Ke, { NP + 1 }>> = Vec::with_capacity(parsed.len());
+    let mut dd_parts: Vec<Parts<Dd, { NS + 1 }>> = Vec::with_capacity(parsed.len());
+    for (k, d) in parsed {
+        kept_parts.push(k);
+        dd_parts.push(d);
+    }
+    let kptr: Vec<usize> = kept_parts.iter_mut().map(|c| c.v.as_mut_ptr() as usize).collect();
+    {
+        let dd_scr: Vec<Mutex<Vec<(u64, u32, u32)>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
+        let kptr = &kptr;
+        let dd_parts = &dd_parts;
+        let kill = |ci: usize, d: &Dd| {
+            if d.loc != u32::MAX {
+                unsafe {
+                    let k = (kptr[ci] as *mut Ke).add(d.loc as usize);
+                    (*k).payload |= 3 << 31;
+                }
+            }
+        };
+        (0..NS).into_par_iter().for_each(|s| {
+            let n: usize = dd_parts.iter().map(|c| c[s].len()).sum();
             let cap = (n + n / 2 + 16).next_power_of_two();
             let mask = cap - 1;
-            // slot: (eid, chunk, idx); eid 0 = empty (hashes are odd)
-            let mut tab: Vec<(u64, u32, u32)> = vec![(0, 0, 0); cap];
-            for (ci, c) in ev_parts.iter().enumerate() {
-                for (ii, e) in c[s].iter().enumerate() {
-                    let mut h = (e.eid as usize) & mask;
+            let tid = rayon::current_thread_index().unwrap_or(nthr - 1);
+            let mut tab = dd_scr[tid].lock().unwrap();
+            tab.clear();
+            tab.resize(cap, (0, 0, 0));
+            for (ci, c) in dd_parts.iter().enumerate() {
+                for (ii, d) in c[s].iter().enumerate() {
+                    let mut h = (d.eid as usize) & mask;
                     loop {
                         let sl_ = unsafe { tab.get_unchecked_mut(h) };
                         if sl_.0 == 0 {
-                            *sl_ = (e.eid, ci as u32, ii as u32);
+                            *sl_ = (d.eid, ci as u32, ii as u32);
                             break;
                         }
-                        if sl_.0 == e.eid {
-                            let b = &ev_parts[sl_.1 as usize][s][sl_.2 as usize];
-                            if e.ingest < b.ingest {
+                        if sl_.0 == d.eid {
+                            let bc = sl_.1 as usize;
+                            let b = &dd_parts[bc][s][sl_.2 as usize];
+                            if d.ingest < b.ingest {
+                                kill(bc, b);
                                 sl_.1 = ci as u32;
                                 sl_.2 = ii as u32;
+                            } else {
+                                kill(ci, d);
                             }
                             break;
                         }
@@ -762,52 +1269,24 @@ fn main() {
                     }
                 }
             }
-            let mut kept: Vec<Ke> = Vec::with_capacity(n);
-            for (ci, c) in ev_parts.iter().enumerate() {
-                for (ii, e) in c[s].iter().enumerate() {
-                    if pl_typ(e.payload) == 3 {
-                        continue;
-                    }
-                    let mut h = (e.eid as usize) & mask;
-                    loop {
-                        let sl_ = unsafe { tab.get_unchecked(h) };
-                        if sl_.0 == e.eid {
-                            if sl_.1 == ci as u32 && sl_.2 == ii as u32 {
-                                kept.push(Ke { person: e.person, payload: e.payload, name: ((e.name as u64) << 16) | e.nlen as u64 });
-                            }
-                            break;
-                        }
-                        h = (h + 1) & mask;
-                    }
-                }
-            }
-            drop(tab);
-            const PF: usize = 16;
-            for i in 0..kept.len().min(PF) {
-                link_tab.prefetch(kept[i].person);
-            }
-            let mut outp: Vec<Vec<Ke>> = new_parts(NP, n / NP + 8);
-            for i in 0..kept.len() {
-                if i + PF < kept.len() {
-                    link_tab.prefetch(kept[i + PF].person);
-                }
-                let mut k = kept[i];
-                k.person = link_tab.person(k.person);
-                outp[pshard(k.person)].push(k);
-            }
-            outp
-        })
-        .collect();
-    drop(ev_parts);
+        });
+    }
+    drop(dd_parts);
     log!("dedup");
 
     // ---- clicks
     let ck_chunks = chunks(&ck_maps, 4 << 20);
-    let ck_parts: Vec<Vec<Vec<Ck>>> = ck_chunks
+    let ck_scr: Vec<Mutex<Vec<Ck>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
+    let ck_parts: Vec<Parts<Ck, { NP + 1 }>> = ck_chunks
         .par_iter()
         .map(|buf| {
-            let mut parts: Vec<Vec<Ck>> = new_parts(NP, buf.len() / 50 / NP + 16);
-            let mut raw: Vec<Ck> = Vec::with_capacity(buf.len() / 45);
+            let tid = rayon::current_thread_index().unwrap_or(nthr - 1);
+            let mut rawg = ck_scr[tid].lock().unwrap();
+            let raw = &mut *rawg;
+            raw.clear();
+            raw.reserve(buf.len() / 5 + 2);
+            let rbase = raw.as_mut_ptr();
+            let mut rn = 0usize;
             scan::<4>(buf, |f| {
                 let (cid, user, camp, ts) = (f[0], f[1], f[2], f[3]);
                 if cid.is_empty() || user.is_empty() {
@@ -818,21 +1297,39 @@ fn main() {
                     return;
                 }
                 let Some(&ci) = camp_map.get(&hb(camp)) else { return };
-                raw.push(Ck { person: hb(user), ts: (t - cws) as u32, camp: ci, clen: cid.len() as u16, cid: cid.as_ptr() as usize });
+                unsafe { rbase.add(rn).write(Ck { person: hb(user), ts: (t - cws) as u32, camp: ci, clen: cid.len() as u16, cid: cid.as_ptr() as usize }) };
+                rn += 1;
             });
+            unsafe { raw.set_len(rn) };
             const PF: usize = 16;
             for i in 0..raw.len().min(PF) {
                 link_tab.prefetch(raw[i].person);
             }
+            let mut kc = [0u32; NP + 1];
             for i in 0..raw.len() {
                 if i + PF < raw.len() {
                     link_tab.prefetch(raw[i + PF].person);
                 }
-                let mut c = raw[i];
+                let c = &mut raw[i];
                 c.person = link_tab.person(c.person);
-                parts[pshard(c.person)].push(c);
+                kc[pshard(c.person) + 1] += 1;
             }
-            parts
+            for i in 0..NP {
+                kc[i + 1] += kc[i];
+            }
+            let off = kc;
+            let n = kc[NP] as usize;
+            let mut v: Vec<Ck> = Vec::with_capacity(n);
+            unsafe {
+                let q = v.as_mut_ptr();
+                for c in raw.iter() {
+                    let ps = pshard(c.person);
+                    q.add(kc[ps] as usize).write(*c);
+                    kc[ps] += 1;
+                }
+                v.set_len(n);
+            }
+            Parts { v, off }
         })
         .collect();
     log!("clicks");
@@ -844,31 +1341,42 @@ fn main() {
     let nthreads = rayon::current_num_threads();
     let camp_accs: Vec<Mutex<Vec<[u64; 4]>>> = (0..nthreads + 1).map(|_| Mutex::new(Vec::new())).collect();
 
+    let ss_scr: Vec<Mutex<(Vec<u32>, Vec<Ke>, Vec<Ck>)>> = (0..nthreads + 1).map(|_| Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
     let user_rows: Vec<Vec<URow>> = (0..NP)
         .into_par_iter()
         .map(|p| {
-            let n: usize = kept_parts.iter().map(|c| c[p].len()).sum();
+            let tid = rayon::current_thread_index().unwrap_or(nthreads);
+            let mut scr = ss_scr[tid].lock().unwrap();
+            let (cnt, ev, cl) = &mut *scr;
             // counting sort by 16 person-hash bits, then small sorts per bucket
             const BB: usize = 1 << 14;
             #[inline(always)]
             fn bkt(h: u64) -> usize {
                 ((h >> 20) as usize) & (BB - 1)
             }
-            let mut cnt = vec![0u32; BB + 1];
+            cnt.clear();
+            cnt.resize(BB + 1, 0);
+            let mut n = 0usize;
             for c in &kept_parts {
                 for e in &c[p] {
-                    cnt[bkt(e.person) + 1] += 1;
+                    let live = (pl_typ(e.payload) != 3) as u32;
+                    cnt[bkt(e.person) + 1] += live;
+                    n += live as usize;
                 }
             }
             for b in 0..BB {
                 cnt[b + 1] += cnt[b];
             }
             let bstart = cnt.clone();
-            let mut ev: Vec<Ke> = Vec::with_capacity(n);
+            ev.clear();
+            ev.reserve(n);
             {
                 let ptr = ev.as_mut_ptr();
                 for c in &kept_parts {
                     for e in &c[p] {
+                        if pl_typ(e.payload) == 3 {
+                            continue;
+                        }
                         let b = bkt(e.person);
                         unsafe { ptr.add(cnt[b] as usize).write(*e) };
                         cnt[b] += 1;
@@ -883,14 +1391,14 @@ fn main() {
                 }
             }
             let nc: usize = ck_parts.iter().map(|c| c[p].len()).sum();
-            let mut cl: Vec<Ck> = Vec::with_capacity(nc);
+            cl.clear();
+            cl.reserve(nc);
             for c in &ck_parts {
                 cl.extend_from_slice(&c[p]);
             }
             cl.sort_unstable_by_key(|c| ((bkt(c.person) as u128) << 96) | ((c.person as u128) << 32) | c.ts as u128);
             let pk = |h: u64| ((bkt(h) as u128) << 64) | h as u128;
 
-            let tid = rayon::current_thread_index().unwrap_or(nthreads);
             let mut accg = camp_accs[tid].lock().unwrap();
             if accg.is_empty() {
                 accg.resize((ncamp + 1) * ndays, [0; 4]);
@@ -906,10 +1414,7 @@ fn main() {
             let mut i = 0usize;
             while i < ev.len() {
                 let person = ev[i].person;
-                let (name, nlen) = match link_tab.find(person) {
-                    Some(h) => link_tab.names[h],
-                    None => ((ev[i].name >> 16) as usize, ev[i].name as u16),
-                };
+                let (name, nlen) = ((ev[i].name >> 16) as usize, ev[i].name as u16);
                 let mut j = i + 1;
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
