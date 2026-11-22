@@ -677,7 +677,9 @@ impl Arena {
         let cap = (cap + (2 << 20) - 1) & !((2 << 20) - 1);
         let base = match memmap2::MmapMut::map_anon(cap + (2 << 20)) {
             Ok(m) => {
-                let _ = m.advise(memmap2::Advice::HugePage);
+                if std::env::var("SS_NOHUGE").is_err() {
+                    let _ = m.advise(memmap2::Advice::HugePage);
+                }
                 let p = m.as_ptr() as usize;
                 std::mem::forget(m);
                 (p + (2 << 20) - 1) & !((2 << 20) - 1)
@@ -715,8 +717,16 @@ struct Dd {
 #[repr(C)]
 struct Ke {
     person: u64,
+    payload: u64, // non-purchase events of unlinked users carry their name at bits 33.. (chunk offset:23 | len:8)
+}
+
+/// Kept event in session scratch (name resolved to ptr << 16 | len, 0 = unknown).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct KeS {
+    person: u64,
     payload: u64,
-    name: u64, // ptr << 16 | len
+    name: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -757,14 +767,14 @@ struct LSlot {
 
 /// Open-addressing table: user hash -> person hash (hash of the byte-wise min ID).
 struct LinkTable {
-    mask: usize,
+    cap: usize,
     slots: Vec<LSlot>, // key 0 = empty
 
 }
 impl LinkTable {
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        (k as usize) & self.mask
+        ((k as u128 * self.cap as u128) >> 64) as usize
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
@@ -785,7 +795,10 @@ impl LinkTable {
             if kk == 0 {
                 return None;
             }
-            h = (h + 1) & self.mask;
+            h += 1;
+            if h == self.cap {
+                h = 0;
+            }
         }
     }
     #[inline(always)]
@@ -980,8 +993,7 @@ fn main() {
         log!("  lk parse");
         let n: usize = lk_pairs.iter().map(|v| v.len()).sum();
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-        let cap = (n * 4).next_power_of_two().max(16);
-        let mask = cap - 1;
+        let cap = n * 3 + 64; // ~2x the expected distinct IDs
         let mut slots: Vec<LSlot> = unsafe {
             let layout = std::alloc::Layout::array::<LSlot>(cap).unwrap();
             let p = std::alloc::alloc_zeroed(layout) as *mut LSlot;
@@ -997,7 +1009,7 @@ fn main() {
         let par_at = |h: usize| unsafe { AtomicU32::from_ptr((pp as *mut u32).add(h)) };
         let best_at = |h: usize| unsafe { AtomicU32::from_ptr((bp as *mut u32).add(h)) };
         let insert = |k: u64, ptr: usize, len: u16| -> u32 {
-            let mut h = (k as usize) & mask;
+            let mut h = ((k as u128 * cap as u128) >> 64) as usize;
             loop {
                 let a = key_at(h);
                 let cur = a.load(Relaxed);
@@ -1014,7 +1026,10 @@ fn main() {
                         Err(_) => {}
                     }
                 }
-                h = (h + 1) & mask;
+                h += 1;
+                if h == cap {
+                    h = 0;
+                }
             }
         };
         let edges: Vec<Vec<(u32, u32)>> = lk_pairs
@@ -1092,7 +1107,7 @@ fn main() {
         });
         drop(parent);
         drop(best);
-        LinkTable { mask, slots }
+        LinkTable { cap, slots }
     };
     log!("links done");
 
@@ -1137,14 +1152,14 @@ fn main() {
     }
     let link_tab = links_job();
     log!("links");
-    let ev_chunks = chunks(&ev_maps, 8 << 20);
+    let ev_chunks = chunks(&ev_maps, (8 << 20) - (1 << 16));
     let nthr = rayon::current_num_threads() + 1;
     let ev_bytes: usize = ev_chunks.iter().map(|b| b.len()).sum();
     let ke_arena = Arena::new(ev_bytes / 30 * std::mem::size_of::<Ke>() + (8 << 20));
     let dd_arena = Arena::new(ev_bytes / 30 * std::mem::size_of::<Dd>() + (8 << 20));
     let st_scr: Vec<Mutex<Vec<Ev>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
     #[allow(clippy::type_complexity)]
-    let parsed: Vec<(Parts<Ke, { NP + 1 }>, Parts<Dd, { NS + 1 }>)> = ev_chunks
+    let parsed: Vec<(Parts<Ke, { NP + 1 }>, Parts<Dd, { NS + 1 }>, Vec<(u64, usize, u16)>)> = ev_chunks
         .par_iter()
         .map(|buf| {
             let tid = rayon::current_thread_index().unwrap_or(nthr - 1);
@@ -1237,8 +1252,7 @@ fn main() {
                     if let Some(h) = link_tab.find(e.person) {
                         let sl_ = &link_tab.slots[h];
                         e.person = sl_.person;
-                        e.name = (sl_.rname >> 16) as usize;
-                        e.nlen = sl_.rname as u16;
+                        e.nlen = 0; // linked: the name comes from the link table
                     }
                     kc[pshard(e.person) + 1] += 1;
                 }
@@ -1256,14 +1270,26 @@ fn main() {
             let tp2 = Instant::now();
             let kq: *mut Ke = ke_arena.alloc(nk);
             let dq: *mut Dd = dd_arena.alloc(nd);
+            let bufp = buf.as_ptr() as usize;
+            let mut fb: Vec<(u64, usize, u16)> = Vec::new();
             unsafe {
                 for e in stg.iter() {
                     let mut loc = u32::MAX;
-                    if pl_typ(e.payload) != 3 {
+                    let typ = pl_typ(e.payload);
+                    if typ != 3 {
                         let ps = pshard(e.person);
                         loc = kc[ps];
                         kc[ps] += 1;
-                        kq.add(loc as usize).write(Ke { person: e.person, payload: e.payload, name: ((e.name as u64) << 16) | e.nlen as u64 });
+                        let mut pl = e.payload;
+                        if e.nlen != 0 {
+                            let off = e.name.wrapping_sub(bufp);
+                            if typ != 2 && e.nlen <= 255 && off < (1 << 23) {
+                                pl |= (((off as u64) << 8) | e.nlen as u64) << 33;
+                            } else {
+                                fb.push((e.person, e.name, e.nlen));
+                            }
+                        }
+                        kq.add(loc as usize).write(Ke { person: e.person, payload: pl });
                     }
                     let es = eshard(e.eid);
                     dq.add(dc[es] as usize).write(Dd { eid: e.eid, ingest: e.ingest, loc });
@@ -1274,7 +1300,7 @@ fn main() {
             PT[0].fetch_add((tp1 - tp0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             PT[1].fetch_add((tp2 - tp1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             PT[2].fetch_add((tp3 - tp2).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            (Parts { ptr: kq, off: koff }, Parts { ptr: dq, off: doff })
+            (Parts { ptr: kq, off: koff }, Parts { ptr: dq, off: doff }, fb)
         })
         .collect();
     log!("parse events: {} chunks  scan {:?} resolve {:?} write {:?}", ev_chunks.len(), std::time::Duration::from_nanos(PT[0].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[1].load(std::sync::atomic::Ordering::Relaxed)), std::time::Duration::from_nanos(PT[2].load(std::sync::atomic::Ordering::Relaxed)));
@@ -1282,10 +1308,15 @@ fn main() {
     // ---- dedup per event shard: mark losing copies dead (typ 3) in place
     let mut kept_parts: Vec<Parts<Ke, { NP + 1 }>> = Vec::with_capacity(parsed.len());
     let mut dd_parts: Vec<Parts<Dd, { NS + 1 }>> = Vec::with_capacity(parsed.len());
-    for (k, d) in parsed {
+    let mut fallback: Vec<(u64, usize, u16)> = Vec::new();
+    for (k, d, f) in parsed {
         kept_parts.push(k);
         dd_parts.push(d);
+        fallback.extend_from_slice(&f);
     }
+    fallback.sort_unstable_by_key(|x| ((pshard(x.0) as u128) << 64) | x.0 as u128);
+    let fb_off: Vec<usize> = (0..=NP).map(|p| fallback.partition_point(|x| pshard(x.0) < p)).collect();
+    let chunk_base: Vec<u64> = ev_chunks.iter().map(|b| b.as_ptr() as u64).collect();
     let kptr: Vec<usize> = kept_parts.iter().map(|c| c.ptr as usize).collect();
     {
         let dd_scr: Vec<Mutex<Vec<(u64, u32, u32)>>> = (0..nthr).map(|_| Mutex::new(Vec::new())).collect();
@@ -1415,7 +1446,7 @@ fn main() {
     for x in PT.iter() {
         x.store(0, std::sync::atomic::Ordering::Relaxed);
     }
-    let ss_scr: Vec<Mutex<(Vec<u32>, Vec<Ke>, Vec<Ck>)>> = (0..nthreads + 1).map(|_| Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
+    let ss_scr: Vec<Mutex<(Vec<u32>, Vec<KeS>, Vec<Ck>)>> = (0..nthreads + 1).map(|_| Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
     let rows_scr: Vec<Mutex<Vec<URow>>> = (0..nthreads + 1).map(|_| Mutex::new(Vec::new())).collect();
     let user_rows: Vec<&[URow]> = (0..NP)
         .into_par_iter()
@@ -1448,13 +1479,17 @@ fn main() {
             ev.reserve(n);
             {
                 let ptr = ev.as_mut_ptr();
-                for c in &kept_parts {
+                for (ci, c) in kept_parts.iter().enumerate() {
+                    let base = chunk_base[ci];
                     for e in &c[p] {
-                        if pl_typ(e.payload) == 3 {
+                        let typ = pl_typ(e.payload);
+                        if typ == 3 {
                             continue;
                         }
+                        let enc = e.payload >> 33;
+                        let name = if typ != 2 && enc & 0xff != 0 { ((base + (enc >> 8)) << 16) | (enc & 0xff) } else { 0 };
                         let b = bkt(e.person);
-                        unsafe { ptr.add(cnt[b] as usize).write(*e) };
+                        unsafe { ptr.add(cnt[b] as usize).write(KeS { person: e.person, payload: e.payload, name }) };
                         cnt[b] += 1;
                     }
                 }
@@ -1513,11 +1548,32 @@ fn main() {
             let mut i = 0usize;
             while i < ev.len() {
                 let person = ev[i].person;
-                let (name, nlen) = ((ev[i].name >> 16) as usize, ev[i].name as u16);
                 let mut j = i + 1;
                 while j < ev.len() && ev[j].person == person {
                     j += 1;
                 }
+                let (name, nlen) = match link_tab.find(person) {
+                    Some(h) => {
+                        let r = link_tab.slots[h].rname;
+                        ((r >> 16) as usize, r as u16)
+                    }
+                    None => {
+                        let mut nm = 0u64;
+                        for e in &ev[i..j] {
+                            if e.name != 0 {
+                                nm = e.name;
+                                break;
+                            }
+                        }
+                        if nm != 0 {
+                            ((nm >> 16) as usize, nm as u16)
+                        } else {
+                            let f = &fallback[fb_off[p]..fb_off[p + 1]];
+                            let k = f.partition_point(|x| x.0 < person);
+                            (f[k].1, f[k].2)
+                        }
+                    }
+                };
                 while cp < cl.len() && pk(cl[cp].person) < pk(person) {
                     cp += 1;
                 }
